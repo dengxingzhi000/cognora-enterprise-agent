@@ -20,7 +20,7 @@ dependencies = [
 # Offline CI (`pip install -e .`) must stay green without any of them.
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.2"]
+mcp = ["mcp>=2.3.0"]
 observability = [
   "prometheus-client>=0.20",
   "opentelemetry-api>=1.27",
@@ -33,7 +33,7 @@ langgraph = [
 cache = ["redis>=5.0"]
 tokenizer = ["tiktoken>=0.7"]
 all = [
-  "mcp>=1.2",
+  "mcp>=2.3.0",
   "prometheus-client>=0.20",
   "opentelemetry-api>=1.27",
   "opentelemetry-sdk>=1.27",
