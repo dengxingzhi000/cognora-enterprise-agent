@@ -161,3 +161,7 @@ def main():
 
 def dump_specs(registry=None) -> str:
     return json.dumps([s.as_dict() for s in build_tool_specs(registry)], ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    main()

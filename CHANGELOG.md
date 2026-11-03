@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [Unreleased]
+
+### Added
+
+- Optional `opentelemetry-exporter-otlp` in the `observability` group. A real
+  OTLP span exporter is created only when both the package and
+  `OTEL_EXPORTER_OTLP_ENDPOINT` are present; otherwise the in-memory Tracer
+  remains active and the chosen path is logged.
+- `python -m agent.mcp.server` starts the MCP server on stdio. MCP is
+  intentionally child-process only; no HTTP daemon or long-running service is
+  claimed.
+
 ## [0.5.0] — 2026-11-03
 
 ### Added

@@ -1,6 +1,4 @@
 """Batch 5: Prometheus /metrics 与 OTel 适配；无依赖时优雅降级。"""
-import sys
-
 import pytest
 
 
@@ -98,6 +96,9 @@ class _FakeTraceApi:
     def get_tracer(self, name):
         return self._tracer
 
+    def set_tracer_provider(self, provider):
+        self.provider = provider
+
 
 def test_otel_adapter_maps_events_and_status():
     from observability.otel import OtelTraceAdapter
@@ -122,12 +123,63 @@ def test_otel_adapter_maps_events_and_status():
         Tracer.otel = None
 
 
-def test_build_otel_adapter_returns_none_without_dependency(monkeypatch):
-    for name in [k for k in list(sys.modules) if k == "opentelemetry" or k.startswith("opentelemetry.")]:
-        monkeypatch.setitem(sys.modules, name, None)
-    from observability.otel import build_otel_adapter, otel_available
-    assert otel_available() is False
-    assert build_otel_adapter() is None
+def test_build_otel_adapter_exporter_paths(monkeypatch, caplog):
+    import logging
+    import observability.otel as otel
+
+    caplog.set_level(logging.INFO)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setattr(otel, "otel_available", lambda: False)
+    assert otel.build_otel_adapter() is None
+    assert "in-memory Tracer" in caplog.text
+
+    # API available but no endpoint => keep memory path.
+    monkeypatch.setattr(otel, "otel_available", lambda: True)
+    assert otel.build_otel_adapter() is None
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT not set" in caplog.text
+
+    # Endpoint set but exporter package missing => keep memory path.
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318/v1/traces")
+    monkeypatch.setattr(otel, "_load_otlp_exporter", lambda: None)
+    assert otel.build_otel_adapter() is None
+    assert "exporter-otlp is not installed" in caplog.text
+
+    # Endpoint + fake exporter/provider => adapter is created and exporter used.
+    calls = {}
+
+    class FakeProvider(_FakeTraceApi):
+        def __init__(self):
+            super().__init__()
+            self.processors = []
+
+        def add_span_processor(self, processor):
+            self.processors.append(processor)
+
+    class FakeProcessor:
+        def __init__(self, exporter):
+            self.exporter = exporter
+
+    def fake_exporter(endpoint):
+        calls["endpoint"] = endpoint
+        return object()
+
+    def fake_provider():
+        provider = FakeProvider()
+        calls["provider"] = provider
+        return provider
+
+    adapter = otel.build_otel_adapter(
+        endpoint="http://127.0.0.1:4318/v1/traces",
+        exporter_factory=fake_exporter,
+        trace_api=_FakeTraceApi(),
+        provider_factory=fake_provider,
+        processor_factory=FakeProcessor,
+    )
+    assert adapter is not None
+    assert calls["endpoint"] == "http://127.0.0.1:4318/v1/traces"
+    assert calls["provider"].processors
+    assert isinstance(calls["provider"].processors[0], FakeProcessor)
+    assert calls["provider"].processors[0].exporter is not None
 
 
 def test_tracer_keeps_memory_trace_without_otel():

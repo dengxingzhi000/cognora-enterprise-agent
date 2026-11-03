@@ -120,6 +120,7 @@ pytest -q
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | 本地确定性 embedding，无外部模型 |
 | `RAG_PGVECTOR_ENABLED` | 未设置 | `1` 开启 pgvector（需要 `vector` 扩展与 DSN） |
 | `RAG_PGVECTOR_DSN` | 未设置 | pgvector DSN；回退到 `AGENT_PG_DSN` / `PG_DSN` / `POSTGRES_DSN` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | 未设置 | 安装 observability 组后启用真实 OTLP exporter；未设置时保持内存 Tracer |
 | `POSTGRES_DSN` / `PG_DSN` | 未设置 | **仅旧版**五层 MemoryStore；不会开启 Agent 持久化 |
 | `CONTEXT_BUDGET_TOKENS` | `8000` | 上下文总预算 |
 | `CONTEXT_RESERVED_TOKENS` | `1000` | 为回复保留的空间 |
@@ -262,9 +263,13 @@ cognora-enterprise-agent/
 
 安装了 `langgraph` 且 checkpointer 是原生实现时，`workflow/graph_lang.py` 运行真正的 `StateGraph`；否则走诚实的模拟路径。LangGraph 1.x 用 `Command(resume=...)` 暂停/恢复，`PostgresSaver` checkpoint 落 `db_agent`。手写的 `workflow/graph.py` 仍是零依赖路径。
 
+### MCP 只支持 stdio，刻意不做常驻服务
+
+`python -m agent.mcp.server` 以 stdio 启动 MCP server。它刻意**不是**常驻 HTTP 服务：MCP 客户端把进程作为子进程拉起，通过 stdin/stdout 通信，因此没有端口、没有 daemon，也没有后台服务需要部署。若要改成长生命周期 HTTP 形态，需要另行设计会话、认证与生命周期；当前发布不声称已经部署常驻 MCP 服务。
+
 ### 不绑定厂商的可观测性
 
-内存 `Tracer` 始终记录任务生命周期。安装 `prometheus-client` 后，`GET /metrics` 输出任务状态、工具调用、trace 事件计数。安装 `opentelemetry-*` 后，同一批事件同步写 span。缺少可选包时只有 503 说明或没有 adapter，绝不影响启动。
+内存 `Tracer` 始终记录任务生命周期。安装 `prometheus-client` 后，`GET /metrics` 输出任务状态、工具调用、trace 事件计数。安装 `opentelemetry-*` 与 `opentelemetry-exporter-otlp` **且** 配置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后，同一批事件通过真实 `SimpleSpanProcessor` / OTLP exporter 写 span。否则代码会记录走哪条路径并保留内存 Tracer；缺包或缺 endpoint 绝不影响启动。endpoint 不是密钥，但日志里不会出现 DSN/密码。
 
 ## 运维
 

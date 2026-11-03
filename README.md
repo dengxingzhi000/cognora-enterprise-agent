@@ -120,6 +120,7 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | Local deterministic embedding; no external model required |
 | `RAG_PGVECTOR_ENABLED` | unset | `1` enables the optional pgvector backend (needs the `vector` extension and a DSN) |
 | `RAG_PGVECTOR_DSN` | unset | pgvector DSN; falls back to `AGENT_PG_DSN` / `PG_DSN` / `POSTGRES_DSN` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enables the real OTLP exporter when the observability group is installed; unset keeps the in-memory Tracer |
 | `POSTGRES_DSN` / `PG_DSN` | unset | **Legacy** five-layer MemoryStore only; does not activate agent persistence |
 | `CONTEXT_BUDGET_TOKENS` | `8000` | Total context-assembly budget |
 | `CONTEXT_RESERVED_TOKENS` | `1000` | Headroom reserved for the reply |
@@ -262,9 +263,13 @@ Every `AgentTask` status transition is appended to `memory_episodic`. Recall sco
 
 `workflow/graph_lang.py` runs a genuine `StateGraph` when `langgraph` is installed and the checkpointer is native; otherwise it runs an honest simulation path. Pause/resume uses `Command(resume=...)` on LangGraph 1.x, and `PostgresSaver` checkpoints are persisted in `db_agent`. The hand-rolled `workflow/graph.py` remains the no-dependency path.
 
+### MCP is stdio-only, by design
+
+`python -m agent.mcp.server` starts the MCP server on stdio. It is deliberately **not** a long-running HTTP service: MCP clients spawn the process as a child and communicate over stdin/stdout, so there is no port, no daemon, and no background service to deploy. A long-lived HTTP transport would be a separate design (session handling, auth, lifecycle) and is not implemented here; the current release does not claim a deployed MCP daemon.
+
 ### Observability without vendor lock-in
 
-The in-memory `Tracer` always records the task lifecycle. If `prometheus-client` is installed, `GET /metrics` renders counters for task status, tool calls, and trace events. If `opentelemetry-*` is installed, the same events are mirrored into spans. Missing optional packages produce a 503 with an explanation or no adapter; they never fail startup.
+The in-memory `Tracer` always records the task lifecycle. If `prometheus-client` is installed, `GET /metrics` renders counters for task status, tool calls, and trace events. If `opentelemetry-*` plus `opentelemetry-exporter-otlp` are installed **and** `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the same events are mirrored into spans through a real `SimpleSpanProcessor` / OTLP exporter. Otherwise the code logs which path it took and keeps the in-memory Tracer; missing packages or endpoints never fail startup. The endpoint is not a secret, but no DSN/password is ever logged.
 
 ## Operations
 
