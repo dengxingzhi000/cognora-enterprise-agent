@@ -19,6 +19,12 @@ def _wrap(state_or_task) -> AgentTask:
 
 
 def _emit_status(task: AgentTask, reason: str) -> None:
+    # 情景记忆：每次状态迁移都落一条 memory_episodic（失败不阻断状态机）。
+    try:
+        from agent.memory.episodic import record_task_transition
+        record_task_transition(task, reason)
+    except Exception:
+        pass
     trace_id = task.state.context.get("trace_id")
     if not trace_id:
         return
@@ -28,6 +34,8 @@ def _emit_status(task: AgentTask, reason: str) -> None:
                 "from": task.history[-1]["from"] if task.history else None,
                 "to": task.status, "reason": reason}
         tracer.log_event(trace_id, "task_status_changed", data)
+        from observability.metrics import inc_task_status
+        inc_task_status(task.status)
     except Exception:
         pass
 
