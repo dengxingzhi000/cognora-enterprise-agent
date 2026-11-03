@@ -150,17 +150,19 @@ pytest -q
 
 ## 已实现 / 需要条件才生效
 
-| 状态 | 能力 | 激活条件 |
-| --- | --- | --- |
-| **始终可用** | 手写 runtime、Tool Registry、Policy/HITL 状态机、本地 hashing RAG、内存 Episodic、内存审批/挂起任务、内存 Tracer、fixture 场景 | 只需 `pip install -e .` |
-| **条件生效** | 持久化审批 / 挂起任务 / Episodic / checkpoint | `AGENT_PG_DSN` 指向 `db_agent`（5432），并已执行 schema |
-| **条件生效** | pgvector 后端 | `RAG_PGVECTOR_ENABLED=1` + 带 `vector` 扩展的 Postgres。已验证测试实例是 `192.168.0.121:5434/db_agent_vector`（`extversion=0.8.7`）；**不要用 5433**，那是另一个项目的容器 |
-| **条件生效** | MCP server | `pip install -e ".[mcp]"`；`python -m agent.mcp.server` 仅 stdio |
-| **条件生效** | Prometheus `/metrics` | `pip install -e ".[observability]"` |
-| **条件生效** | OTLP spans | `pip install -e ".[observability]"` + `OTEL_EXPORTER_OTLP_ENDPOINT`（gRPC 4317 / HTTP 4318）；未设置保持内存 Tracer |
-| **条件生效** | 真 LangGraph / PG checkpoint | `pip install -e ".[langgraph]"`；PG checkpoint 还需 `AGENT_PG_DSN` |
-| **条件生效** | 真实 SCM 工具 | `SCM_GATEWAY_URL` + 认证配置；否则工具保持 mock |
-| **未声称** | 生产 collector/告警、OTLP 后端保留、MCP HTTP daemon、kill/restart 演练 | 本仓库未实现 |
+| 状态 | 能力 | 激活条件 | 验证状态 |
+| --- | --- | --- | --- |
+| **始终可用** | 手写 runtime、Tool Registry、Policy/HITL 状态机、本地 hashing RAG、内存 Episodic、内存审批/挂起任务、内存 Tracer、fixture 场景 | 只需 `pip install -e .` | CI（单测/fixture） |
+| **条件生效** | 持久化审批 / 挂起任务 / Episodic / checkpoint | `AGENT_PG_DSN` 指向 `db_agent`（5432），并已执行 schema | 真实 PG `db_agent` 已手动验证；无 `AGENT_TEST_PG_DSN` 时 CI skip |
+| **条件生效** | pgvector 后端 | `RAG_PGVECTOR_ENABLED=1` + 带 `vector` 扩展的 Postgres。已验证测试实例是 `192.168.0.121:5434/db_agent_vector`（`extversion=0.8.7`）；**不要用 5433**，那是另一个项目的容器 | 真实实例已手动验证（5434，vector 0.8.7）；CI 只走内存索引 |
+| **条件生效** | MCP server | `pip install -e ".[mcp]"`；`python -m agent.mcp.server` 仅 stdio | 工具注册有 CI 单测；stdio 启动为手动验证，不是常驻 daemon |
+| **条件生效** | Prometheus `/metrics` | `pip install -e ".[observability]"` | CI 单测覆盖 200 / 503 |
+| **条件生效** | OTLP spans | `pip install -e ".[observability]"` + `OTEL_EXPORTER_OTLP_ENDPOINT`（gRPC 4317 / HTTP 4318）；未设置保持内存 Tracer | exporter 接线有 CI 单测；真实 collector 投递已手动验证（4317/4318，指标出口 8889）；无厂商后端 |
+| **条件生效** | 真 LangGraph / PG checkpoint | `pip install -e ".[langgraph]"`；PG checkpoint 还需 `AGENT_PG_DSN` | 装可选组时图测试在 CI 运行；PG checkpoint 为手动验证，无 DSN 时 skip |
+| **条件生效** | 真实 SCM 工具 | `SCM_GATEWAY_URL` + 认证配置；否则工具保持 mock | CI 走 mock；本仓库未验证真实 gateway |
+| **未声称** | 生产 collector/告警、OTLP 后端保留、MCP HTTP daemon、kill/restart 演练 | 本仓库未实现 | — |
+
+**验证口径：**「CI」表示每次绿色构建都会实际执行该路径；「手动」表示只在表中实例上跑过一次，CI 不会重复。手动结果不等于 CI 保证。
 
 ## 技术栈
 

@@ -3,8 +3,8 @@
 Compact guidance for future OpenCode sessions. Only repo-specific, hard-to-infer facts.
 
 ## What this repo is
-- Self-built Enterprise AI Operations Agent (Python 3.13+, FastAPI, DeepSeek via OpenAI-compatible API).
-- Architecture: `FastAPI Gateway (:8761) → Agent Runtime (Planner/Executor loop) → Tool Registry → MCP/DB/RAG → Policy/HITL → Workflow → Eval/Obs`.
+- Self-built Enterprise AI Operations Agent (Python 3.12 / 3.13, FastAPI, DeepSeek via OpenAI-compatible API).
+- Architecture: `FastAPI Gateway (:8762) → Agent Runtime (Planner/Executor loop) → Tool Registry → MCP/DB/RAG → Policy/HITL → Workflow → Eval/Obs`.
 - Strategy: hand-rolled Runtime first (TDD), then LangGraph parity check at Stage 8.
 - Three target scenarios (in order): IT Ops → Contract Compliance → Sales Analytics. Operates against the sibling `scm-platform` repo.
 
@@ -15,13 +15,16 @@ py -m venv .venv
 .\.venv\Scripts\activate
 pip install -e .         # optional extras: .[mcp] .[observability] .[langgraph]
 copy .env.example .env   # fill DEEPSEEK_API_KEY (real or sk-xxxx for echo fallback)
-pytest -q                # 183 passed, 8 skipped (bare install; 187/6 with .[observability,langgraph,mcp])
+pytest -q                # 183/8 bare; 187/6 with .[observability,langgraph,mcp]; 192/1 with AGENT_TEST_PG_DSN -> db_agent; 193/0 with -> db_agent_vector
 uvicorn apps.api.main:app --port 8762 --reload
 # DeepSeek connectivity sanity check:
 python scripts/check_deepseek.py
 ```
 - `.env` is git-ignored; never commit `DEEPSEEK_API_KEY` or any real key (PR template explicitly checks this).
 - Without a real key the runtime degrades to echo (`[runtime-echo] <task>`) — see `agent/runtime/llm_planner.py:14` — so tests still pass offline.
+- Verification boundary: CI only runs the bare install (183/8). Real PG,
+  pgvector and OTLP results are manual and recorded in README; do not describe
+  fixture-only tests as real-environment validation.
 
 ## TDD discipline (REQUIRED)
 This repo is built RED → GREEN per stage. Before any implementation:
