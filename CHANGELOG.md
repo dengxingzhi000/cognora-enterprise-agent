@@ -321,8 +321,8 @@ now carries `AGENT_PORT=8762` and `SCM_GATEWAY_URL=http://localhost:8761`.
 
 [Unreleased]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.5.0...HEAD
 [0.5.0]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.4.1...v0.5.0
-[0.4.1]: https://github.com/dengxingzhi000/enterprise-agent/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/dengxingzhi000/enterprise-agent/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/dengxingzhi000/enterprise-agent/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/dengxingzhi000/enterprise-agent/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dengxingzhi000/enterprise-agent/releases/tag/v0.1.0
+[0.4.1]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.1.0
