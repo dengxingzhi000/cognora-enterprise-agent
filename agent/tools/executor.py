@@ -1,5 +1,9 @@
 """Registry Executor: 把 Planner 的 call_tool 翻译成真实调用。工具失败→Observation，不抛异常。"""
+import logging
+
 from .builtin import build_default_registry
+
+logger = logging.getLogger(__name__)
 
 _default_registry = None
 
@@ -21,9 +25,12 @@ def registry_executor(plan: dict, state, registry=None) -> dict:
     except KeyError:
         ok = False
         result = f"unknown tool: {tool}"
-    except Exception as e:  # noqa: BLE001 - 工具错误必须变成Observation
+    except Exception:  # noqa: BLE001 - 工具错误必须变成Observation
+        # 异常文本只进日志（含栈），Observation 只保留工具名，避免把异常信息
+        # 经 /chat 或 /chat/{task_id}/resume 回显给调用方（py/stack-trace-exposure）。
+        logger.exception("tool %s failed", tool)
         ok = False
-        result = f"tool error {tool}: {e}"
+        result = f"tool error {tool}"
     try:
         from observability.metrics import record_tool_call
         record_tool_call(tool, ok)

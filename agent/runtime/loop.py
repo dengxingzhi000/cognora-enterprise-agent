@@ -1,5 +1,6 @@
 """Agent Loop: Task → Planner → Executor → Observation → Reflection → ... → Final"""
 import dataclasses
+import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 from observability.tracing import Tracer
@@ -7,6 +8,8 @@ from .state import AgentState
 from .planner import default_planner, default_executor
 from .agent_task import AgentTask
 from .counter import get_counter, get_pricing
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent.context.assembler import ContextAssembler
@@ -104,10 +107,11 @@ def run(
                 planner_state = inner
         try:
             plan = planner(planner_state)
-        except Exception as e:
+        except Exception:  # noqa: BLE001 - 异常只进日志，不回显到响应
+            logger.exception("planner failed")
             inner.plan = None
             inner.status = "failed"
-            inner.answer = f"planner_error: {e}"
+            inner.answer = "planner_error"
             _record_tokens(task, llm_messages or inner.messages, "")
             task.transition("failed", "planner_error")
             _emit_status(task, "planner_error")
@@ -127,9 +131,10 @@ def run(
             _record_tokens(task, llm_messages if assembler else inner.messages, "")
             try:
                 obs = executor(plan, inner)
-            except Exception as e:
+            except Exception:  # noqa: BLE001 - 异常只进日志，不回显到响应
+                logger.exception("executor failed")
                 inner.status = "failed"
-                inner.answer = f"executor_error: {e}"
+                inner.answer = "executor_error"
                 _record_tokens(task, llm_messages or inner.messages, "")
                 task.transition("failed", "executor_error")
                 _emit_status(task, "executor_error")
