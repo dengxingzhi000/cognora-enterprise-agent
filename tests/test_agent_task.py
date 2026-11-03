@@ -128,7 +128,7 @@ def test_loop_planner_exception_marks_failed():
     assert at.status == "failed"
     assert at.history[-1]["reason"] == "planner_error"
     assert "planner_error" in result.answer
-    assert "boom" in result.answer
+    assert "boom" not in result.answer
 
 
 def test_loop_executor_exception_marks_failed():
@@ -145,7 +145,7 @@ def test_loop_executor_exception_marks_failed():
     assert at.status == "failed"
     assert at.history[-1]["reason"] == "executor_error"
     assert "executor_error" in result.answer
-    assert "executor_boom" in result.answer
+    assert "executor_boom" not in result.answer
 
 
 def test_loop_records_tokens_on_unknown_action_failure():
