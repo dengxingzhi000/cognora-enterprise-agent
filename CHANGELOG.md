@@ -8,17 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
-## [Unreleased]
+## [0.5.1] — 2026-11-03
 
 ### Added
 
 - Optional `opentelemetry-exporter-otlp` in the `observability` group. A real
   OTLP span exporter is created only when both the package and
   `OTEL_EXPORTER_OTLP_ENDPOINT` are present; otherwise the in-memory Tracer
-  remains active and the chosen path is logged.
+  remains active and the chosen path is logged. gRPC (4317) and HTTP (4318)
+  endpoints are selected by port or `OTEL_EXPORTER_OTLP_PROTOCOL`.
 - `python -m agent.mcp.server` starts the MCP server on stdio. MCP is
   intentionally child-process only; no HTTP daemon or long-running service is
   claimed.
+- Real pgvector verification against `192.168.0.121:5434/db_agent_vector`
+  (`vector 0.8.7`): `tests/test_rag.py` = 7 passed, full suite = 193 passed,
+  0 skipped. Port **5433** is not used; it belongs to another project.
+
+### Changed — dependency refresh
+
+Runtime core (verified with 187 passed / 6 skipped after each batch):
+
+| Package | Before | After |
+| --- | --- | --- |
+| fastapi | 0.141.1 | 0.162.0 |
+| uvicorn[standard] | 0.53.0 | 0.54.0 |
+| pydantic | 2.13.5 | 2.14.2 |
+| pydantic-settings | 2.15.0 | 2.16.2 |
+| openai | 3.14.0 | 3.42.1 |
+| sqlalchemy | 2.0.54 | 2.1.6 |
+| psycopg[binary] | 3.3.5 | 3.3.7 |
+| starlette (transitive) | 1.6.0 | 1.10.0 |
+| anyio (transitive) | 4.15.1 | 4.16.0 |
+
+Optional/tooling:
+
+| Package | Before | After |
+| --- | --- | --- |
+| mcp | 2.3.0 | 2.3.0 (already latest) |
+| prometheus-client | 0.26.0 | 0.26.0 (already latest) |
+| opentelemetry-api/sdk/exporter | 1.45.2 | 1.45.2 (already latest) |
+| langgraph | 1.2.19 | 1.2.19 (already latest) |
+| langgraph-checkpoint-postgres | 3.2.0 | 3.2.0 (already latest) |
+| langchain-core (transitive) | 1.7.3 | 1.7.4 |
+| redis | not installed | 8.1.0 |
+| tiktoken | not installed | 0.14.0 |
+| pytest | 9.1.1 | 9.2.0 |
+| pytest-asyncio | 1.4.0 | 1.4.1.post1 |
+
+Held:
+
+- `uuid_utils` stays at **0.19.0** (latest 1.2.0) because `langsmith 0.14.17`
+  requires `uuid-utils<1.0,>=0.12.0`; upgrading it breaks the LangGraph stack.
+- `pip` itself stays at 25.3 (26.3 available); it is tooling, not a project
+  dependency, and is not part of the application environment contract.
 
 ## [0.5.0] — 2026-11-03
 
@@ -319,7 +361,8 @@ The gateway port moved from `:8761` to `:8762` in v0.2.0 so it does not
 collide with the scm-platform gateway, which also uses 8761. `.env.example`
 now carries `AGENT_PORT=8762` and `SCM_GATEWAY_URL=http://localhost:8761`.
 
-[Unreleased]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.3.0...v0.4.0

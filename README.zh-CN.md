@@ -9,7 +9,7 @@
 **一个 FastAPI 网关。手写 Planner/Executor 循环。无需云账号、无需付费依赖、无需任何凭据即可跑通离线路径。**
 
 [![Build](https://img.shields.io/github/actions/workflow/status/dengxingzhi000/cognora-enterprise-agent/ci.yml?branch=master&style=flat-square&logo=github&label=build)](https://github.com/dengxingzhi000/cognora-enterprise-agent/actions)
-[![Release](https://img.shields.io/github/v/release/dengxingzhi000/cognora-enterprise-agent?style=flat-square&label=v0.5.0)](https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.5.0)
+[![Release](https://img.shields.io/github/v/release/dengxingzhi000/cognora-enterprise-agent?style=flat-square&label=v0.5.1)](https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.5.1)
 [![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white&style=flat-square)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](./LICENSE)
 
@@ -148,6 +148,20 @@ pytest -q
 | 🧾 | **Agent 任务** | 状态机、token 用量、按模型计价、状态历史环形缓冲 |
 | 🔒 | **安全** | 明确 Policy 层；不把原始异常文本直接返回；租户隔离 repository |
 
+## 已实现 / 需要条件才生效
+
+| 状态 | 能力 | 激活条件 |
+| --- | --- | --- |
+| **始终可用** | 手写 runtime、Tool Registry、Policy/HITL 状态机、本地 hashing RAG、内存 Episodic、内存审批/挂起任务、内存 Tracer、fixture 场景 | 只需 `pip install -e .` |
+| **条件生效** | 持久化审批 / 挂起任务 / Episodic / checkpoint | `AGENT_PG_DSN` 指向 `db_agent`（5432），并已执行 schema |
+| **条件生效** | pgvector 后端 | `RAG_PGVECTOR_ENABLED=1` + 带 `vector` 扩展的 Postgres。已验证测试实例是 `192.168.0.121:5434/db_agent_vector`（`extversion=0.8.7`）；**不要用 5433**，那是另一个项目的容器 |
+| **条件生效** | MCP server | `pip install -e ".[mcp]"`；`python -m agent.mcp.server` 仅 stdio |
+| **条件生效** | Prometheus `/metrics` | `pip install -e ".[observability]"` |
+| **条件生效** | OTLP spans | `pip install -e ".[observability]"` + `OTEL_EXPORTER_OTLP_ENDPOINT`（gRPC 4317 / HTTP 4318）；未设置保持内存 Tracer |
+| **条件生效** | 真 LangGraph / PG checkpoint | `pip install -e ".[langgraph]"`；PG checkpoint 还需 `AGENT_PG_DSN` |
+| **条件生效** | 真实 SCM 工具 | `SCM_GATEWAY_URL` + 认证配置；否则工具保持 mock |
+| **未声称** | 生产 collector/告警、OTLP 后端保留、MCP HTTP daemon、kill/restart 演练 | 本仓库未实现 |
+
 ## 技术栈
 
 | 层 | 组件 |
@@ -259,6 +273,8 @@ cognora-enterprise-agent/
 
 `KnowledgeStore` 在 embedding 与向量打分之前先按租户和权限过滤候选。默认 embedding provider 是本地 feature hashing，因此 `pip install -e .` 不需要下载模型，也没有网络依赖。`pgvector` 是 `RAG_PGVECTOR_ENABLED=1` 后面的可选后端；扩展或 DSN 缺失时回退内存 store。
 
+真实 pgvector 实例已验证：`192.168.0.121:5434/db_agent_vector`，扩展 `vector 0.8.7`。`tests/test_rag.py` 在该库 **7/7 通过**，向量命中测试首先返回运维文档。不要复用 **5433**，它被另一个项目占用。主持久化库仍是 `192.168.0.121:5432/db_agent`，它没有 `vector` 扩展，因此那里的 pgvector 测试按设计 skip。
+
 ### 安装后才启用的真 LangGraph
 
 安装了 `langgraph` 且 checkpointer 是原生实现时，`workflow/graph_lang.py` 运行真正的 `StateGraph`；否则走诚实的模拟路径。LangGraph 1.x 用 `Command(resume=...)` 暂停/恢复，`PostgresSaver` checkpoint 落 `db_agent`。手写的 `workflow/graph.py` 仍是零依赖路径。
@@ -269,7 +285,9 @@ cognora-enterprise-agent/
 
 ### 不绑定厂商的可观测性
 
-内存 `Tracer` 始终记录任务生命周期。安装 `prometheus-client` 后，`GET /metrics` 输出任务状态、工具调用、trace 事件计数。安装 `opentelemetry-*` 与 `opentelemetry-exporter-otlp` **且** 配置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后，同一批事件通过真实 `SimpleSpanProcessor` / OTLP exporter 写 span。否则代码会记录走哪条路径并保留内存 Tracer；缺包或缺 endpoint 绝不影响启动。endpoint 不是密钥，但日志里不会出现 DSN/密码。
+内存 `Tracer` 始终记录任务生命周期。安装 `prometheus-client` 后，`GET /metrics` 输出任务状态、工具调用、trace 事件计数。安装 `opentelemetry-*` 与 `opentelemetry-exporter-otlp` **且** 配置 `OTEL_EXPORTER_OTLP_ENDPOINT` 后，同一批事件通过真实 `SimpleSpanProcessor` / OTLP exporter 写 span（gRPC 4317 或 HTTP 4318；`_protocol_for` 按端口选择）。否则代码会记录走哪条路径并保留内存 Tracer；缺包或缺 endpoint 绝不影响启动。endpoint 不是密钥，但日志里不会出现 DSN/密码。
+
+验证 collector 接受了 OTLP metrics：`curl http://192.168.0.121:8889/metrics` 暴露 `agent_verify_points_total{result="ok"} 3`（HTTP）与 `agent_verify_grpc_points_total{result="ok"} 7`（gRPC）。该 collector 只是本地 HTTP/gRPC receiver + Prometheus exporter + debug 输出，没有外部后端、保留或告警，不声称是生产部署。
 
 ## 运维
 
@@ -291,7 +309,7 @@ psql "$AGENT_PG_DSN" -f scripts/db/agent_schema.sql
 
 `.github/workflows/ci.yml` 在 `master` 上跑 Python **3.12 / 3.13** 矩阵，`pip install -e .` 后执行 `pytest -q -rs`；并发取消重复运行，权限最小化为 `contents: read`。CI 刻意不配置 `AGENT_TEST_PG_DSN`、`DEEPSEEK_API_KEY` 或 `SCM_GATEWAY_URL`，所以 Postgres/pgvector 集成测试与可选依赖探测按设计 skip；离线套件必须全绿。
 
-`master` 已启用 branch protection：要求 PR、禁止强推、禁止删除分支，不强制 review 数。`v0.5.0` 是附注 tag，Release 从 tag 创建。
+`master` 已启用 branch protection：要求 PR、禁止强推、禁止删除分支，不强制 review 数。`v0.5.1` 是附注 tag，Release 从 tag 创建。
 
 ### 测试
 
@@ -304,13 +322,18 @@ pip install -e . && pytest -q
 pip install -e ".[mcp,observability,langgraph]" && pytest -q
 # 187 passed, 6 skipped
 
-# 真实 Postgres 集成（db_agent）
+# 真实 Postgres 集成（db_agent；无 vector 扩展）
 export AGENT_TEST_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5432/db_agent"
 pytest -q
-# 192 passed, 1 skipped
+# 192 passed, 1 skipped（pgvector）
+
+# 真实 pgvector 集成（db_agent_vector；vector 0.8.7）
+export AGENT_TEST_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5434/db_agent_vector"
+pytest -q
+# 193 passed, 0 skipped
 ```
 
-剩余 skip 是 pgvector：当前 Postgres 镜像没有 `vector` 扩展。内存向量路径由单元测试覆盖；集成测试会清理自己的数据，手工验证行也在检查后删除。
+`db_agent` 的 skip 是 pgvector：该 Postgres 镜像没有 `vector` 扩展。在 `db_agent_vector` 上全套测试全绿，且 `tests/test_rag.py` 为 **7 passed, 0 skipped**。两个库验证后都已清理（`agent_approval`、`agent_paused_task`、`memory_*`、`agent_knowledge_chunk` 均为 0 行）。
 
 ## FAQ
 

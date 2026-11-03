@@ -18,7 +18,7 @@ from security.approval import build_approval_store
 from security.policy import PolicyEngine
 from agent.runtime.paused_tasks import build_paused_task_store
 
-app = FastAPI(title="Enterprise Agent Gateway", version="0.5.0")
+app = FastAPI(title="Enterprise Agent Gateway", version="0.5.1")
 
 # HITL 状态：审批单与挂起任务用 repository 抽象。
 # AGENT_PG_DSN 是唯一开关；有值走 Postgres，否则自动回落 InMemory，
