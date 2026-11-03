@@ -150,17 +150,21 @@ Every value has a working offline default. Secrets belong in the environment, ne
 
 ## What is live vs conditional
 
-| Status | Capability | What unlocks it |
-| --- | --- | --- |
-| **Always on** | Hand-written runtime, Tool Registry, Policy/HITL transitions, local hashing RAG, in-memory episodic memory, in-memory approvals/paused tasks, in-memory Tracer, fixture scenarios | `pip install -e .` only |
-| **Conditional** | Durable approvals / paused tasks / episodic / checkpoints | `AGENT_PG_DSN` pointing at `db_agent` (5432), schema already applied |
-| **Conditional** | pgvector backend | `RAG_PGVECTOR_ENABLED=1` + a Postgres with the `vector` extension. The verified test instance is `192.168.0.121:5434/db_agent_vector` (`extversion=0.8.7`); **do not use 5433**, which belongs to another project |
-| **Conditional** | MCP server | `pip install -e ".[mcp]"`; `python -m agent.mcp.server` runs stdio only |
-| **Conditional** | Prometheus `/metrics` | `pip install -e ".[observability]"` |
-| **Conditional** | OTLP spans | `pip install -e ".[observability]"` + `OTEL_EXPORTER_OTLP_ENDPOINT` (gRPC 4317 / HTTP 4318); unset keeps the in-memory Tracer |
-| **Conditional** | Real LangGraph graph / PG checkpoints | `pip install -e ".[langgraph]"`; PG checkpoints also need `AGENT_PG_DSN` |
-| **Conditional** | Real SCM tools | `SCM_GATEWAY_URL` + auth settings; otherwise tools stay mocked |
-| **Not claimed** | Production collector/alerting, OTLP backend retention, MCP HTTP daemon, kill-process/restart harness | Not implemented in this repository |
+| Status | Capability | What unlocks it | Verification |
+| --- | --- | --- | --- |
+| **Always on** | Hand-written runtime, Tool Registry, Policy/HITL transitions, local hashing RAG, in-memory episodic memory, in-memory approvals/paused tasks, in-memory Tracer, fixture scenarios | `pip install -e .` only | CI (unit/fixture) |
+| **Conditional** | Durable approvals / paused tasks / episodic / checkpoints | `AGENT_PG_DSN` pointing at `db_agent` (5432), schema already applied | Real PG `db_agent` verified manually; CI skips without `AGENT_TEST_PG_DSN` |
+| **Conditional** | pgvector backend | `RAG_PGVECTOR_ENABLED=1` + a Postgres with the `vector` extension. The verified test instance is `192.168.0.121:5434/db_agent_vector` (`extversion=0.8.7`); **do not use 5433**, which belongs to another project | Real instance verified manually (5434, vector 0.8.7); CI exercise uses the in-memory index only |
+| **Conditional** | MCP server | `pip install -e ".[mcp]"`; `python -m agent.mcp.server` runs stdio only | Tool registration is unit-tested in CI; the stdio launch is manual and is not a deployed daemon |
+| **Conditional** | Prometheus `/metrics` | `pip install -e ".[observability]"` | CI unit tests cover the 200 and 503 responses |
+| **Conditional** | OTLP spans | `pip install -e ".[observability]"` + `OTEL_EXPORTER_OTLP_ENDPOINT` (gRPC 4317 / HTTP 4318); unset keeps the in-memory Tracer | Exporter wiring is unit-tested in CI; real collector delivery was verified manually (4317/4318, metrics on 8889); no vendor backend |
+| **Conditional** | Real LangGraph graph / PG checkpoints | `pip install -e ".[langgraph]"`; PG checkpoints also need `AGENT_PG_DSN` | Graph tests run in CI with extras; PG checkpoints were verified manually and skip without a DSN |
+| **Conditional** | Real SCM tools | `SCM_GATEWAY_URL` + auth settings; otherwise tools stay mocked | Mock path runs in CI; a real gateway is not verified by this repository |
+| **Not claimed** | Production collector/alerting, OTLP backend retention, MCP HTTP daemon, kill-process/restart harness | Not implemented in this repository | — |
+
+**Verification labels:** **CI** means every green build exercises the path.
+**Manual** means it was run once against the instance named in the row and is
+not repeated by CI. A manual result is not a CI guarantee.
 
 ## Tech stack
 

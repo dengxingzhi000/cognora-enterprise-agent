@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [Unreleased]
+
+### Documentation
+
+- README (EN/ZH) now separates **CI** coverage from **manual** verification in
+  the conditional-capability table, so fixture tests are not presented as
+  real-environment validation.
+- Roadmap records v0.5.0/v0.5.1 as released, marks the OTLP exporter and the
+  pgvector `5434` instance as manually verified, and updates the test matrix to
+  include `193 passed, 0 skipped` against `db_agent_vector`.
+- AGENTS.md corrects the supported Python range to 3.12/3.13, the gateway port
+  to 8762, and the test-count matrix; it also states the CI/manual boundary.
+
 ## [0.5.1] — 2026-11-03
 
 ### Added
