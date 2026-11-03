@@ -1,0 +1,90 @@
+# Official label set for cognora-enterprise-agent.
+#
+# Apply with:
+#   gh label create <name> --color <hex> --description <text>
+#
+# Colors: red = broken, green = ready, yellow = needs a decision,
+# blue = area, grey = housekeeping.
+- name: bug
+  color: d73a4a
+  description: Something behaves differently from what the docs say it does
+
+- name: enhancement
+  color: a2eeef
+  description: New capability or a change to an existing one
+
+- name: documentation
+  color: 0075ca
+  description: README, docs/, or ADR changes only
+
+- name: question
+  color: d876e3
+  description: Usage question - the discussion belongs in Discussions, not Issues
+
+- name: needs-triage
+  color: fbca04
+  description: Not yet reviewed by a maintainer
+
+- name: needs-decision
+  color: fbca04
+  description: Blocked on a design or scope decision
+
+- name: good-first-issue
+  color: 7057ff
+  description: Small, self-contained, and a good way to learn the codebase
+
+- name: help-wanted
+  color: 159818
+  description: A maintainer would like help on this
+
+- name: wontfix
+  color: c2e0c6
+  description: Will not be done - the issue stays open so the decision is visible
+
+- name: duplicate
+  color: c2e0c6
+  description: Already reported elsewhere
+
+- name: stale
+  color: c2e0c6
+  description: No activity for 60 days
+
+- name: breaking-change
+  color: b60205
+  description: Breaks an existing interface, format, or documented behavior
+
+- name: area:runtime
+  color: 1d76db
+  description: agent/runtime, planner/executor loop, task state machine
+
+- name: area:memory
+  color: 1d76db
+  description: agent/memory and context memory providers
+
+- name: area:persistence
+  color: 1d76db
+  description: Postgres connectors, schemas, approvals and paused tasks
+
+- name: area:rag
+  color: 1d76db
+  description: knowledge/ ingestion, embedding, vector index and rerank
+
+- name: area:mcp
+  color: 1d76db
+  description: agent/mcp and MCP tool exposure
+
+- name: area:observability
+  color: 1d76db
+  description: Tracer, Prometheus metrics and OpenTelemetry adapter
+
+- name: area:workflow
+  color: 1d76db
+  description: workflow graphs, durable guards and scenarios
+
+- name: area:ci
+  color: 1d76db
+  description: GitHub Actions, packaging and release plumbing
+
+- name: dependencies
+  color: 0366d6
+  description: Dependency updates

@@ -1,15 +1,26 @@
-name: ci
+name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    name: pytest (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
@@ -22,4 +33,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
       - name: Test
-        run: pytest -q
+        # -rs prints skip reasons. This job intentionally has no
+        # AGENT_TEST_PG_DSN, DEEPSEEK_API_KEY, or SCM_GATEWAY_URL, so the
+        # Postgres/pgvector integration cases and the optional-dependency
+        # probes skip by design; the remaining offline suite must stay green.
+        run: pytest -q -rs
+      - name: Explain skipped integration tests
+        if: always()
+        run: |
+          echo "No AGENT_TEST_PG_DSN / DEEPSEEK_API_KEY / SCM_GATEWAY_URL is configured in CI."
+          echo "Postgres/pgvector integration tests are skipif-gated and optional deps are probed;"
+          echo "see README.md 'Postgres persistence setup' and the optional groups in pyproject.toml."

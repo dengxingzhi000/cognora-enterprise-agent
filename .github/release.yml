@@ -1,0 +1,33 @@
+# GitHub Release Notes categorization.
+# https://docs.github.com/en/repositories/releasing-projects-on-github/automatically-generated-release-notes
+#
+# Labels referenced here must exist in the repository first (see labels.yml).
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+      - duplicate
+      - question
+      - wontfix
+    authors:
+      - dependabot[bot]
+  categories:
+    - title: Breaking Changes
+      labels:
+        - breaking-change
+    - title: Features
+      labels:
+        - enhancement
+    - title: Bug Fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Build & CI
+      labels:
+        - area:ci
+        - dependencies
+    - title: Other Changes
+      labels:
+        - '*'

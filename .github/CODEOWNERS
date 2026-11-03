@@ -1,0 +1,14 @@
+# Default owner for this repository.
+* @dengxingzhi000
+
+# CI and release plumbing.
+.github/ @dengxingzhi000
+
+# Security-sensitive configuration and persistence.
+scripts/db/ @dengxingzhi000
+security/ @dengxingzhi000
+infrastructure/pg/ @dengxingzhi000
+
+# Documentation.
+docs/ @dengxingzhi000
+*.md @dengxingzhi000

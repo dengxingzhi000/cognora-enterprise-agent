@@ -1,0 +1,61 @@
+# Auto-label rules consumed by actions/labeler
+# (.github/workflows/labeler.yml). A PR gets every label whose globset is
+# touched. Label names must exist in the repository first (see labels.yml).
+
+area:runtime:
+  - changed-files:
+      - any-glob-to-any-file: agent/runtime/**/*
+
+area:memory:
+  - changed-files:
+      - any-glob-to-any-file:
+          - agent/memory/**/*
+          - agent/context/memory_providers.py
+
+area:persistence:
+  - changed-files:
+      - any-glob-to-any-file:
+          - infrastructure/pg/**/*
+          - scripts/db/**/*
+          - security/approval.py
+
+area:rag:
+  - changed-files:
+      - any-glob-to-any-file: knowledge/**/*
+
+area:mcp:
+  - changed-files:
+      - any-glob-to-any-file: agent/mcp/**/*
+
+area:observability:
+  - changed-files:
+      - any-glob-to-any-file: observability/**/*
+
+area:workflow:
+  - changed-files:
+      - any-glob-to-any-file:
+          - workflow/**/*
+          - evaluation/**/*
+
+area:ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - .github/**/*
+          - pyproject.toml
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+          - docs/**/*
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - pyproject.toml
+
+breaking-change:
+  - changed-files:
+      - any-glob-to-any-file:
+          - security/policy.py
+          - scripts/db/agent_schema.sql
