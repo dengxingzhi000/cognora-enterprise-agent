@@ -8,7 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
-## [Unreleased]
+## [0.5.2] — 2026-11-03
+
+Patch release: documentation verification boundaries plus two regression tests.
 
 ### Documentation
 
@@ -30,6 +32,15 @@ Version numbers are cut from the roadmap, not derived automatically, so
 - Bare install is now `185 passed, 8 skipped`; with extras `189 passed, 6 skipped`.
   The PG/pgvector rows remain the last manual measurements (192/1 and 193/0
   before these two tests) and are labelled as such in the README.
+
+### Known limitations
+
+- MCP is stdio-only (child process), not a resident HTTP service.
+- OTLP spans reach a collector, but no vendor backend, alerting or retention
+  policy is configured.
+- PG/pgvector integration cases skip when `AGENT_TEST_PG_DSN` is absent.
+- No kill/restart drill has been run; the PG checkpoint test only proves a new
+  saver instance can resume, not a new process.
 
 ## [0.5.1] — 2026-11-03
 
