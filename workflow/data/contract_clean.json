@@ -1,0 +1,6 @@
+{
+  "contract_id": "C-2026-002",
+  "amount": 3000,
+  "supplier_id": "SP-002",
+  "clauses": ["标准付款条款", "标准验收条款"]
+}

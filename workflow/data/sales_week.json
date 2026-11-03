@@ -1,0 +1,20 @@
+{
+  "period": "7d",
+  "note": "离线样例数据，用于销售分析场景；不是外部系统的实时返回。",
+  "rows": [
+    {"date": "2026-09-09", "category": "数码", "gmv": 60000, "orders": 150, "failed_payments": 8},
+    {"date": "2026-09-10", "category": "数码", "gmv": 58000, "orders": 145, "failed_payments": 7},
+    {"date": "2026-09-11", "category": "数码", "gmv": 61000, "orders": 152, "failed_payments": 9},
+    {"date": "2026-09-09", "category": "家居", "gmv": 30000, "orders": 100, "failed_payments": 5},
+    {"date": "2026-09-10", "category": "家居", "gmv": 31000, "orders": 102, "failed_payments": 4},
+    {"date": "2026-09-11", "category": "家居", "gmv": 32000, "orders": 105, "failed_payments": 6},
+    {"date": "2026-09-12", "category": "数码", "gmv": 50000, "orders": 130, "failed_payments": 15},
+    {"date": "2026-09-12", "category": "家居", "gmv": 29000, "orders": 98, "failed_payments": 8},
+    {"date": "2026-09-13", "category": "数码", "gmv": 45000, "orders": 118, "failed_payments": 22},
+    {"date": "2026-09-13", "category": "家居", "gmv": 27000, "orders": 92, "failed_payments": 11},
+    {"date": "2026-09-14", "category": "数码", "gmv": 42000, "orders": 110, "failed_payments": 30},
+    {"date": "2026-09-14", "category": "家居", "gmv": 25000, "orders": 88, "failed_payments": 16},
+    {"date": "2026-09-15", "category": "数码", "gmv": 40000, "orders": 105, "failed_payments": 45},
+    {"date": "2026-09-15", "category": "家居", "gmv": 24000, "orders": 85, "failed_payments": 20}
+  ]
+}
