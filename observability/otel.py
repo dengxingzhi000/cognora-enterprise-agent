@@ -64,9 +64,20 @@ class OtelTraceAdapter:
             self._provider.shutdown()
 
 
-def _load_otlp_exporter():
+def _protocol_for(endpoint: str) -> str:
+    """OTLP gRPC 常用 4317，HTTP 常用 4318；显式协议优先。"""
+    explicit = os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "").lower()
+    if explicit in ("grpc", "http/protobuf", "http"):
+        return "grpc" if explicit == "grpc" else "http"
+    return "grpc" if endpoint.rstrip("/").endswith(":4317") else "http"
+
+
+def _load_otlp_exporter(protocol: str = "http"):
     try:
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        if protocol == "grpc":
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        else:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         return OTLPSpanExporter
     except Exception:
         return None
@@ -100,7 +111,8 @@ def build_otel_adapter(endpoint: str | None = None, exporter_factory=None,
         log.info("OTEL_EXPORTER_OTLP_ENDPOINT not set; using in-memory Tracer")
         return None
 
-    exporter_factory = exporter_factory or _load_otlp_exporter()
+    protocol = _protocol_for(endpoint)
+    exporter_factory = exporter_factory or _load_otlp_exporter(protocol)
     if exporter_factory is None:
         log.warning("OTEL_EXPORTER_OTLP_ENDPOINT set but "
                     "opentelemetry-exporter-otlp is not installed; "
@@ -116,14 +128,16 @@ def build_otel_adapter(endpoint: str | None = None, exporter_factory=None,
         if trace_api is None:
             import opentelemetry.trace as trace_api  # type: ignore
         provider = provider_factory()
-        exporter = exporter_factory(endpoint)
+        exporter_endpoint = ("http://" + endpoint[len("grpc://"):]
+                             if endpoint.startswith("grpc://") else endpoint)
+        exporter = exporter_factory(exporter_endpoint)
         provider.add_span_processor(processor_factory(exporter))
         # 让 adapter 使用同一个 provider；全局 provider 仅作为 best effort。
         try:
             trace_api.set_tracer_provider(provider)
         except Exception:  # noqa: BLE001 - 已设置过时不阻断
             pass
-        log.info("OTLP span exporter enabled")
+        log.info("OTLP span exporter enabled (protocol=%s)", protocol)
         return OtelTraceAdapter(trace_api=trace_api, tracer_provider=provider)
     except Exception as exc:  # noqa: BLE001 - exporter 失败不能阻断业务
         log.warning("OTLP exporter init failed (%s); using in-memory Tracer", exc)

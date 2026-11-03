@@ -129,7 +129,10 @@ def test_build_otel_adapter_exporter_paths(monkeypatch, caplog):
 
     caplog.set_level(logging.INFO)
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_PROTOCOL", raising=False)
     monkeypatch.setattr(otel, "otel_available", lambda: False)
+    assert otel._protocol_for("http://127.0.0.1:4317") == "grpc"
+    assert otel._protocol_for("http://127.0.0.1:4318") == "http"
     assert otel.build_otel_adapter() is None
     assert "in-memory Tracer" in caplog.text
 
@@ -140,7 +143,7 @@ def test_build_otel_adapter_exporter_paths(monkeypatch, caplog):
 
     # Endpoint set but exporter package missing => keep memory path.
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318/v1/traces")
-    monkeypatch.setattr(otel, "_load_otlp_exporter", lambda: None)
+    monkeypatch.setattr(otel, "_load_otlp_exporter", lambda protocol="http": None)
     assert otel.build_otel_adapter() is None
     assert "exporter-otlp is not installed" in caplog.text
 
