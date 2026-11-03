@@ -120,9 +120,15 @@ class MemoryStore:
             body = r.get("body")
             if body is None:
                 continue
-            try:
-                parsed = json.loads(body)
-            except (TypeError, ValueError):
+            if isinstance(body, str):
+                try:
+                    parsed = json.loads(body)
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(body, (dict, list)):
+                # psycopg/SQLAlchemy 会把 JSONB 直接解码成 Python 对象。
+                parsed = body
+            else:
                 continue
             out = dict(r)
             out["body"] = parsed

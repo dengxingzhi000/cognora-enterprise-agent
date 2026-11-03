@@ -73,5 +73,7 @@ class AgentTask:
             "token_usage": dict(self.token_usage),
             "cost": self.cost,
             "answer": self.state.answer,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
             "history": list(self.history),
         }

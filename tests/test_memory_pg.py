@@ -36,6 +36,22 @@ def test_memory_store_tenant_isolation_and_permission_filter():
     assert rows[0]["body"]["name"] == "alice"
 
 
+def test_memory_store_query_accepts_predecoded_jsonb_body():
+    """pgvector/psycopg 路径会把 JSONB 直接返回成 dict，不能再 json.loads 一次。"""
+    from infrastructure.pg.connector import InMemoryConnector
+    from agent.memory.store import MemoryStore
+    c = InMemoryConnector()
+    c.execute("CREATE TABLE memory_user (id INT, tenant_id TEXT, permission TEXT, body TEXT)")
+    s = MemoryStore(c)
+    s.put("user", "tenant_a", {"name": "alice"}, permission="public")
+    # 模拟 psycopg 返回已解码的 JSONB
+    for row in c._tables["memory_user"]:
+        row["body"] = {"name": "alice"}
+    rows = s.query("user", "tenant_a", permission="public")
+    assert len(rows) == 1
+    assert rows[0]["body"]["name"] == "alice"
+
+
 def test_memory_store_outage_degrades_silently(monkeypatch):
     from infrastructure.pg.connector import InMemoryConnector, OperationalError
     from agent.memory.store import MemoryStore

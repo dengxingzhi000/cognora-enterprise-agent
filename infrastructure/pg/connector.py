@@ -104,9 +104,39 @@ class InMemoryConnector(BaseConnector):
         return None
 
 
+def _normalize_dsn(dsn: str) -> str:
+    """psycopg2 未安装时 SQLAlchemy 默认驱动会导入失败；显式指向 psycopg 3。"""
+    if dsn.startswith("postgresql://"):
+        return "postgresql+psycopg://" + dsn[len("postgresql://"):]
+    if dsn.startswith("postgres://"):
+        return "postgresql+psycopg://" + dsn[len("postgres://"):]
+    return dsn
+
+
+def _named_params(sql: str, params):
+    """把 qmark 占位符翻译成 SQLAlchemy 的 :pN 命名参数。"""
+    if params is None or isinstance(params, dict):
+        return sql, params or {}
+    if not params:
+        return sql, {}
+    if "?" not in sql:
+        return sql, params
+    parts = sql.split("?")
+    if len(parts) != len(params) + 1:
+        return sql, params
+    out = [parts[0]]
+    bind: dict[str, Any] = {}
+    for i, part in enumerate(parts[1:]):
+        out.append(f":p{i}")
+        out.append(part)
+        bind[f"p{i}"] = params[i]
+    return "".join(out), bind
+
+
 class PGConnector(BaseConnector):
     def __init__(self, dsn: str, pool_size: int = 5):
         from sqlalchemy import create_engine
+        dsn = _normalize_dsn(dsn)
         self._engine = create_engine(
             dsn, pool_size=pool_size, pool_pre_ping=True, future=True
         )
@@ -118,7 +148,8 @@ class PGConnector(BaseConnector):
         for attempt in range(1, 5):
             try:
                 with self._engine.connect() as conn:
-                    result = conn.execute(text(sql), tuple(params))
+                    bound_sql, bound_params = _named_params(sql, params)
+                    result = conn.execute(text(bound_sql), bound_params)
                     if op == "execute":
                         conn.commit()
                         return None
@@ -148,6 +179,34 @@ class PGConnector(BaseConnector):
     def ensure_schema(self) -> None:
         from .schema import ensure_schema as _ensure
         _ensure(self)
+
+
+def agent_dsn() -> str | None:
+    """Agent 持久化的唯一开关：``AGENT_PG_DSN``（受 AGENT_PG_OFFLINE 控制）。
+
+    不再回退到 ``PG_DSN``/``POSTGRES_DSN``；后者仅保留给旧版 MemoryStore。
+    """
+    if os.environ.get("AGENT_PG_OFFLINE") == "1" or os.environ.get("PG_OFFLINE") == "1":
+        return None
+    return os.environ.get("AGENT_PG_DSN") or None
+
+
+def get_agent_connector(dsn: str | None = None) -> BaseConnector | None:
+    """返回可用的 PG connector；无 DSN/不可达时返回 None 让调用方回落 InMemory。"""
+    dsn = dsn or agent_dsn()
+    if not dsn:
+        return None
+    try:
+        c = PGConnector(dsn, pool_size=int(os.environ.get("AGENT_POOL_SIZE", "3")))
+        if not c.healthcheck():
+            warnings.warn("agent PG healthcheck failed; falling back to in-memory")
+            return None
+        from .schema import ensure_schema
+        ensure_schema(c)
+        return c
+    except Exception as e:  # noqa: BLE001 - 持久化不可用不能阻断启动
+        warnings.warn(f"agent PG unavailable ({e}); falling back to in-memory")
+        return None
 
 
 def get_connector() -> BaseConnector:

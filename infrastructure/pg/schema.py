@@ -39,6 +39,29 @@ SCHEMA_DDL: list[str] = [
         created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now()
     )""",
     """CREATE INDEX IF NOT EXISTS idx_memory_episodic_tenant ON memory_episodic(tenant_id)""",
+    # --- Agent 自身持久化（Batch 2：审批单 + 挂起任务） ---
+    """CREATE TABLE IF NOT EXISTS agent_approval (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        user_id TEXT,
+        user_json JSONB NOT NULL,
+        tool TEXT NOT NULL,
+        args JSONB NOT NULL DEFAULT '{}'::jsonb,
+        status TEXT NOT NULL DEFAULT 'pending',
+        approver TEXT,
+        consumed BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_agent_approval_tenant ON agent_approval(tenant_id, status)""",
+    """CREATE TABLE IF NOT EXISTS agent_paused_task (
+        tenant_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        state JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (tenant_id, task_id)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_agent_paused_task_tenant ON agent_paused_task(tenant_id)""",
 ]
 
 
