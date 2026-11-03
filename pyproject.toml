@@ -31,7 +31,7 @@ langgraph = [
   "langgraph-checkpoint-postgres>=2.0",
 ]
 cache = ["redis>=5.0"]
-tokenizer = ["tiktoken>=0.7"]
+tokenizer = ["tiktoken>=0.14.0"]
 all = [
   "mcp>=1.2",
   "prometheus-client>=0.20",
@@ -40,7 +40,7 @@ all = [
   "langgraph>=0.2",
   "langgraph-checkpoint-postgres>=2.0",
   "redis>=5.0",
-  "tiktoken>=0.7",
+  "tiktoken>=0.14.0",
 ]
 
 [build-system]
