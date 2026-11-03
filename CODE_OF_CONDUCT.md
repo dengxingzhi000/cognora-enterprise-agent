@@ -56,9 +56,9 @@ an individual is officially representing the community in public spaces.
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
 reported through GitHub's
-[private reporting](https://github.com/dengxingzhi000/enterprise-agent/security/advisories/new)
+[private reporting](https://github.com/dengxingzhi000/cognora-enterprise-agent/security/advisories/new)
 or by opening an issue at
-<https://github.com/dengxingzhi000/enterprise-agent/issues> if the matter is not
+<https://github.com/dengxingzhi000/cognora-enterprise-agent/issues> if the matter is not
 sensitive enough to require privacy.
 
 All complaints will be reviewed and investigated promptly and fairly. All
