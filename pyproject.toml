@@ -12,7 +12,7 @@ dependencies = [
   "openai>=1.40",
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
-  "sqlalchemy>=2.0",
+  "sqlalchemy>=2.1.6",
   "psycopg[binary]>=3.1",
 ]
 
