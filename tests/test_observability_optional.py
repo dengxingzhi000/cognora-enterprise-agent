@@ -184,6 +184,35 @@ def test_build_otel_adapter_exporter_paths(monkeypatch, caplog):
     assert isinstance(calls["provider"].processors[0], FakeProcessor)
     assert calls["provider"].processors[0].exporter is not None
 
+    # grpc:// is normalised to http:// before it reaches the OTLP exporter.
+    normalized = otel.build_otel_adapter(
+        endpoint="grpc://127.0.0.1:4317",
+        exporter_factory=fake_exporter,
+        trace_api=_FakeTraceApi(),
+        provider_factory=fake_provider,
+        processor_factory=FakeProcessor,
+    )
+    assert normalized is not None
+    assert calls["endpoint"] == "http://127.0.0.1:4317"
+
+
+def test_protocol_override_and_invalid_fallback(monkeypatch):
+    """Explicit protocol wins; unknown values fall back to the port heuristic."""
+    import observability.otel as otel
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+    assert otel._protocol_for("http://127.0.0.1:4318") == "grpc"
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+    assert otel._protocol_for("http://127.0.0.1:4317") == "http"
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http")
+    assert otel._protocol_for("http://127.0.0.1:4317") == "http"
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "invalid")
+    assert otel._protocol_for("http://127.0.0.1:4317") == "grpc"
+    assert otel._protocol_for("http://127.0.0.1:4318") == "http"
+
 
 def test_tracer_keeps_memory_trace_without_otel():
     from observability.tracing import Tracer

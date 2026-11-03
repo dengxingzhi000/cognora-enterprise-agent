@@ -83,7 +83,7 @@ uvicorn apps.api.main:app --port 8762 --reload
 
 ```bash
 pytest -q
-# 裸装 183 passed, 8 skipped
+# 裸装 185 passed, 8 skipped
 ```
 
 可选依赖与真实 Postgres 的精确数字见[测试](#测试)。
@@ -318,21 +318,21 @@ psql "$AGENT_PG_DSN" -f scripts/db/agent_schema.sql
 ```bash
 # 裸装（无可选依赖、无 DSN）
 pip install -e . && pytest -q
-# 183 passed, 8 skipped
+# 185 passed, 8 skipped
 
 # 可选依赖，仍无 DSN
 pip install -e ".[mcp,observability,langgraph]" && pytest -q
-# 187 passed, 6 skipped
+# 189 passed, 6 skipped
 
 # 真实 Postgres 集成（db_agent；无 vector 扩展）
 export AGENT_TEST_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5432/db_agent"
 pytest -q
-# 192 passed, 1 skipped（pgvector）
+# 192 passed, 1 skipped（pgvector；在边界测试加入前测得）
 
 # 真实 pgvector 集成（db_agent_vector；vector 0.8.7）
 export AGENT_TEST_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5434/db_agent_vector"
 pytest -q
-# 193 passed, 0 skipped
+# 193 passed, 0 skipped（在边界测试加入前测得）
 ```
 
 `db_agent` 的 skip 是 pgvector：该 Postgres 镜像没有 `vector` 扩展。在 `db_agent_vector` 上全套测试全绿，且 `tests/test_rag.py` 为 **7 passed, 0 skipped**。两个库验证后都已清理（`agent_approval`、`agent_paused_task`、`memory_*`、`agent_knowledge_chunk` 均为 0 行）。

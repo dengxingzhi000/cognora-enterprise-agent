@@ -83,7 +83,7 @@ Open <http://localhost:8762/docs> for the OpenAPI UI. `GET /health` returns `{"s
 
 ```bash
 pytest -q
-# 183 passed, 8 skipped on a bare install
+# 185 passed, 8 skipped on a bare install
 ```
 
 See [Testing](#testing) for the optional-extras and real-Postgres numbers.
@@ -320,21 +320,21 @@ If `psql` is unavailable, the same DDL can be executed with any Postgres client 
 ```bash
 # Bare install (no optional extras, no DSN)
 pip install -e . && pytest -q
-# 183 passed, 8 skipped
+# 185 passed, 8 skipped
 
 # Optional extras, still no DSN
 pip install -e ".[mcp,observability,langgraph]" && pytest -q
-# 187 passed, 6 skipped
+# 189 passed, 6 skipped
 
 # Real Postgres integration (db_agent; no vector extension)
 export AGENT_TEST_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5432/db_agent"
 pytest -q
-# 192 passed, 1 skipped (pgvector)
+# 192 passed, 1 skipped (pgvector; measured before the boundary tests below)
 
 # Real pgvector integration (db_agent_vector; vector 0.8.7)
 export AGENT_TEST_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5434/db_agent_vector"
 pytest -q
-# 193 passed, 0 skipped
+# 193 passed, 0 skipped (measured before the boundary tests below)
 ```
 
 The `db_agent` skip is pgvector: that Postgres image has no `vector` extension. On `db_agent_vector` the full suite is green and `tests/test_rag.py` is **7 passed, 0 skipped**. Both databases were cleaned after verification (`agent_approval`, `agent_paused_task`, `memory_*`, `agent_knowledge_chunk` = 0 rows).

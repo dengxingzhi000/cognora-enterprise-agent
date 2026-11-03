@@ -21,6 +21,16 @@ Version numbers are cut from the roadmap, not derived automatically, so
 - AGENTS.md corrects the supported Python range to 3.12/3.13, the gateway port
   to 8762, and the test-count matrix; it also states the CI/manual boundary.
 
+### Testing
+
+- Pin the API 500 response so an unexpected exception cannot echo
+  `str(exc)` to the caller.
+- Cover explicit OTLP protocol overrides (`grpc`, `http/protobuf`, `http`) and
+  unknown-value fallback to the port heuristic, plus `grpc://` normalization.
+- Bare install is now `185 passed, 8 skipped`; with extras `189 passed, 6 skipped`.
+  The PG/pgvector rows remain the last manual measurements (192/1 and 193/0
+  before these two tests) and are labelled as such in the README.
+
 ## [0.5.1] — 2026-11-03
 
 ### Added
