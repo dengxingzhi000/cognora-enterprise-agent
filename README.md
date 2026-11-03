@@ -39,9 +39,10 @@ pip install -e . && uvicorn apps.api.main:app --port 8762
 > [!NOTE]
 > **Self-built Runtime first, LangGraph later.** `loop` / `state` / `planner` /
 > `executor` are all hand-written and driven by TDD, each layer independently
-> testable. LangGraph rework is planned as a controlled comparison, not a
-> starting dependency. Three target scenarios: **IT operations → contract
-> compliance → data analysis**; `run_it_ops` is wired today.
+> testable. LangGraph is now an optional real path for comparison, not a
+> starting dependency. All three scenarios are wired: **IT operations →
+> contract compliance → data analysis** (`run_it_ops`, `review_contract`,
+> `analyze_sales`).
 
 ---
 
@@ -58,10 +59,18 @@ orchestration, and Eval plus Trace observability.
 
 Every `SCM_*` external dependency degrades to a mock when unset, so **the full
 test suite and the offline path run with no credentials at all** — not as a
-compromise, but so 128 tests never depend on a service being up.
+compromise, but so the tests never require a service to be up. A fresh
+`pip install -e .` reports **183 passed, 8 skipped**; the skips are the
+DSN-gated Postgres/pgvector integration tests plus optional-dependency probes
+(`langgraph` module, `mcp`, and `prometheus-client`).
 
-Current v0.4.1 covers SCM integration v2 and the closed HITL loop: **128
-tests passed** (99 at the v0.4.0 baseline, 29 added in v0.4.1).
+Current HEAD covers the HITL round trip plus episodic memory, durable
+approvals/paused tasks, the MCP stub, vector RAG, optional observability, a real
+LangGraph/PG-checkpoint path and fixture-driven contract/sales scenarios:
+**183 passed, 8 skipped** on a bare install; **187 passed, 6 skipped** with the
+`.[observability,langgraph,mcp]` extras; **192 passed, 1 skipped** with
+`AGENT_TEST_PG_DSN` pointing at `db_agent` (the remaining skip is pgvector,
+which the VM image does not provide).
 
 ## Quick start
 
@@ -89,7 +98,7 @@ pip install -e .
 copy .env.example .env          # Linux/macOS: cp .env.example .env
                                   # DEEPSEEK_API_KEY may be left empty
 
-pytest -q                       # 128 passed
+pytest -q                       # 183 passed, 8 skipped (bare install)
 uvicorn apps.api.main:app --port 8762 --reload
 ```
 
@@ -101,6 +110,9 @@ Then open <http://localhost:8762/docs> and `POST /chat`.
 |---|---|---|
 | `GET` | `/health` | Liveness — returns `{"status": "ok", "stage": 1}` |
 | `POST` | `/chat` | Runs one agent task; see the request and response below |
+| `POST` | `/approval/{approval_id}/decide` | Approve or reject the approval a paused task is waiting on |
+| `POST` | `/chat/{task_id}/resume` | Execute the approved action, or cancel the task when rejected |
+| `GET` | `/metrics` | Prometheus text metrics when `prometheus-client` is installed; otherwise 503 with a reason |
 | `GET` | `/docs` | OpenAPI UI |
 
 ```bash
@@ -113,6 +125,51 @@ A completed run returns `reply`, `status`, `task_id`, `trace_id`, and — when t
 agent had tokens — `token_usage` and `cost`. A run that hits an approval gate
 returns `status: "paused"` plus `approval_id`, `approval_tool`, and
 `approval_args`.
+
+The HITL round trip is two calls:
+
+```bash
+curl -X POST http://localhost:8762/approval/apr-1/decide \
+  -H "Content-Type: application/json" \
+  -d '{"decision": "approve", "approver": "mgr-1", "tenant_id": "t1"}'
+
+curl -X POST http://localhost:8762/chat/<task_id>/resume \
+  -H "Content-Type: application/json" -d '{"tenant_id": "t1"}'
+```
+
+`decide` only records the decision. `resume` executes the single approved action
+and closes the task (`status: "done"`, with `execution_result`); a rejected
+approval cancels it (`status: "cancelled"`).
+
+Both stores sit behind a repository interface. Without a DSN they are
+in-process (a restart loses pending approvals); set `AGENT_PG_DSN` to
+`db_agent` and apply `scripts/db/agent_schema.sql` to persist `agent_approval`,
+`agent_paused_task` and the `memory_*` tables in Postgres.
+
+### Postgres persistence setup
+
+`AGENT_PG_DSN` is the only switch for agent persistence. Credentials must come
+from the deployment environment, never from repository files:
+
+```bash
+# 1) create the dedicated database (run as an admin connection)
+psql "postgresql://<user>:<password>@192.168.0.121:5432/postgres" \
+     -c "CREATE DATABASE db_agent OWNER <user>;"
+
+# 2) create/upgrade the tables (idempotent)
+export AGENT_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5432/db_agent"
+psql "$AGENT_PG_DSN" -f scripts/db/agent_schema.sql
+
+# 3) run the app / tests with the same environment
+export AGENT_PG_DSN=...
+pytest -q
+```
+
+If `psql` is unavailable, the same DDL can be executed with any Postgres client
+(for example `psycopg`); `scripts/db/agent_schema.sql` is plain DDL. Without
+`AGENT_PG_DSN` the repositories stay in memory and the suite remains offline-safe.
+`PG_DSN`/`POSTGRES_DSN` are legacy MemoryStore settings and do **not** turn on
+agent persistence.
 
 ### Environment variables
 
@@ -131,8 +188,13 @@ the tests and the offline path.
 | `SCM_TIMEOUT_SECONDS` | `5` | Per-request timeout |
 | `SCM_RETRY_BACKOFF_SECONDS` | `0.3` | Sleep before the single retry on 5xx / `ConnectError` / `Timeout` |
 | `AGENT_PORT` | `8762` | Port the gateway expects |
-| `POSTGRES_DSN` / `PG_DSN` | unset | Memory store; `PG_DSN` wins if both are set |
-| `PG_OFFLINE` | unset | Force the memory store offline regardless of DSN |
+| `AGENT_PG_DSN` | unset | **The only switch** for approvals, paused tasks, episodic memory and checkpoints. Point it at `db_agent`; unset ⇒ in-memory repositories |
+| `AGENT_PG_OFFLINE` / `PG_OFFLINE` | unset | Force agent persistence and the memory store offline regardless of DSN |
+| `AGENT_TEST_PG_DSN` | unset | Opt-in trigger for the real-Postgres integration tests; never read by the application |
+| `RAG_EMBEDDING_PROVIDER` | `hashing` | Local deterministic embedding; no external model is required |
+| `RAG_PGVECTOR_ENABLED` | unset | `1` enables the optional pgvector backend (needs the `vector` extension and a DSN) |
+| `RAG_PGVECTOR_DSN` | unset | DSN for pgvector; falls back to `AGENT_PG_DSN`/`PG_DSN`/`POSTGRES_DSN` |
+| `POSTGRES_DSN` / `PG_DSN` | unset | **Legacy** five-layer MemoryStore only; does not activate agent persistence |
 | `CONTEXT_BUDGET_TOKENS` | `8000` | Assembler enforces total usage ≤ budget |
 | `CONTEXT_RESERVED_TOKENS` | `1000` | Held back for the reply |
 | `CONTEXT_COMPRESS_RATIO` | `0.8` | Compress once usage exceeds this fraction of available |
@@ -148,10 +210,13 @@ the tests and the offline path.
 > production, treat that warning as an error.
 
 > [!NOTE]
-> `langgraph`, `redis`, and `tiktoken` are deliberately **not** hard
-> requirements. `workflow/checkpoint.py` warns and uses an in-memory checkpointer
-> when `langgraph` is absent; token counting falls back to a heuristic without
-> `tiktoken`. Offline CI has to stay green.
+> `langgraph`, `mcp`, `prometheus-client`, `opentelemetry-*`, `redis`, and
+> `tiktoken` are deliberately **not** hard requirements. They live in optional
+> groups (`pip install -e .[langgraph]`, `.[mcp]`, `.[observability]`).
+> `workflow/checkpoint.py` warns and uses an in-memory checkpointer when
+> `langgraph` is absent; `/metrics` returns 503 without `prometheus-client`; the
+> MCP server raises `MCPUnavailable` without `mcp`; token counting falls back to
+> a heuristic without `tiktoken`. Offline CI has to stay green.
 
 ## Capabilities
 
@@ -159,16 +224,31 @@ the tests and the offline path.
 |---|---|---|---|
 | 🔁 | **Agent loop** | Hand-built Planner/Executor loop, not a framework wrapper | `agent/runtime`, each stage TDD'd independently |
 | 🧰 | **Tool registry** | One dispatch path for MCP / DB / RAG tools | `agent/tools`; every write tool registered so the planner never hits `unknown tool` |
+| 🧩 | **MCP server** | `metrics.get` / `logs.search` / `git.diff` exposed with MCP-shaped results | `agent/mcp/server.py`; **activated only with `pip install -e .[mcp]`** |
 | 🛡️ | **Policy** | Read ⇒ allow, write ⇒ need approval, unknown ⇒ deny | `integrations/scm/policy_map.py`, default deny |
 | ✋ | **Human-in-the-loop** | Task suspends on approval and resumes by id | `guarded_executor` → `paused` transition → `approval_id` in the response |
-| 📉 | **Observability** | Every tool call and result traced via `contextvar` | `observability/`; `scm_call` / `scm_result` events |
-| 🧠 | **Context & memory** | Budgeted assembly, compression, persistent memory | `agent/context`, `agent/memory`; degrades when PG is down |
-| 📚 | **Retrieval** | RAG over the knowledge base | `knowledge/` |
-| 🔀 | **Workflow** | Multi-step orchestration and checkpoints | `workflow/`, with a durable LangGraph path when installed |
+| 💾 | **Durable HITL** | Approvals and paused tasks survive a restart | `security/approval.py` + `agent/runtime/paused_tasks.py`; **Postgres only when `AGENT_PG_DSN` is set**, otherwise in-process |
+| 📉 | **Observability** | `contextvar` traces plus Prometheus metrics and OTel spans | `observability/`; `/metrics` needs `prometheus-client`; OTel needs `opentelemetry-*` |
+| 🧠 | **Context & memory** | Budgeted assembly, compression, five memory layers | `agent/context`, `agent/memory`; episodic recall is real, degrades when PG is down |
+| 📚 | **Retrieval** | RAG with local embeddings, vector recall and rerank | `knowledge/`, always on with deterministic hashing; pgvector is **opt-in** and needs the DB extension |
+| 🔀 | **Workflow** | Multi-step orchestration and checkpoints | `workflow/`; real `StateGraph` when `langgraph` is installed, simulation otherwise |
+| 🧪 | **Scenarios** | IT ops, contract compliance, sales analysis | fixture/dict-driven; missing data returns `insufficient_data`; real SCM only with `SCM_GATEWAY_URL` |
 | 📊 | **Evaluation** | Eval suites | `evaluation/` |
 | 🔒 | **Security** | Separate policy and validation layer | `security/` |
 | 🔁 | **Reliability** | One retry with configurable backoff on 5xx / `ConnectError` / `Timeout` | `SCM_RETRY_BACKOFF_SECONDS` |
 | 💰 | **Cost** | Per-task token usage and cost accumulation | `AgentTask`, priced off `DEEPSEEK_MODEL` |
+
+**What is actually live vs conditional**
+
+- Always on: hand-built runtime, tool registry, policy/HITL transitions, local
+  RAG (hashing embedding + memory index), in-memory episodic memory, in-memory
+  approval/paused state, memory tracer, fixture scenarios.
+- Conditional: Postgres HITL/checkpoint (`AGENT_PG_DSN`), MCP server (`.[mcp]`),
+  Prometheus (`.[observability]`), OTel spans (`.[observability]`), real
+  LangGraph (`.[langgraph]`), pgvector (`RAG_PGVECTOR_ENABLED=1` + extension),
+  real SCM calls (`SCM_GATEWAY_URL`).
+- Not claimed: multi-process outbox, OTLP collector deployment, a true
+  kill-process/new-process resume harness, or pgvector on the current VM.
 
 ## Architecture
 
@@ -232,28 +312,30 @@ recovery path.
 
 **Mocks are the default, not the fallback.** `register_scm_tools` checks
 `_use_mock()` — which is just "is `SCM_GATEWAY_URL` set". Unset means mock. That
-is what makes 128 offline tests possible and CI hermetic.
+is what makes the offline test suite possible and CI hermetic.
 
 ### Project structure
 
 ```
 enterprise-agent/
 ├── apps/
-│   └── api/main.py          # FastAPI gateway: /health, /chat
+│   └── api/main.py          # FastAPI gateway: /health, /chat, /approval, /resume
 ├── agent/
-│   ├── runtime/             # loop · planner · state · status · agent_task · counter
+│   ├── runtime/             # loop · planner · state · status · agent_task · counter · paused_tasks
 │   ├── tools/               # registry · executor (guarded) · builtin
-│   ├── context/             # assembler, budget, compression
-│   └── memory/              # persistent store
+│   ├── mcp/                 # optional MCP server (metrics/logs/git)
+│   ├── context/             # assembler, budget, compression, episodic provider
+│   └── memory/              # persistent store + episodic
 ├── integrations/
 │   └── scm/                 # client · auth · tools · policy_map
-├── security/                # PolicyEngine · ApprovalStore
-├── workflow/                # graph · durable · checkpoint · scenarios
-├── knowledge/               # RAG retrieval
+├── security/                # PolicyEngine · ApprovalStore/repositories
+├── workflow/                # graph · durable · checkpoint · scenarios · data/
+├── knowledge/               # RAG retrieval · embedding · vector index · pgvector
 ├── evaluation/              # eval suites
-├── observability/           # Tracer and trace store
+├── observability/           # Tracer · Prometheus metrics · OTel adapter
 ├── infrastructure/pg/       # connector, schema
-├── tests/                   # 128 tests
+├── scripts/db/              # agent_schema.sql (db_agent)
+├── tests/                   # 183 bare-install tests (192 with extras + PG DSN)
 └── docs/superpowers/        # specs/ (design) + plans/ (TDD plans)
 ```
 
@@ -304,8 +386,9 @@ The default is closed.
 <summary><strong>Will it run without a DeepSeek API key?</strong></summary>
 
 Yes. The planner falls back to `echo` and every `SCM_*` tool returns mock data.
-That is exactly why the 128 tests depend on no external service, and `pytest -q`
-should be fully green offline.
+That is exactly why the offline tests depend on no external service, and
+`pytest -q` should be fully green offline (only the DSN-gated integration tests
+and optional-dependency tests skip).
 
 </details>
 
@@ -346,14 +429,18 @@ the policy layer ever gets to approve it.
 <details>
 <summary><strong>Is HITL actually wired end to end?</strong></summary>
 
-The suspend-and-resume path is: `/chat` returns `status: "paused"` with an
-`approval_id`, and the trace records the transition. `workflow/durable.py` and
-`tests/test_durable_langgraph.py` cover the durable checkpoint path.
+The full round trip now exists: `/chat` returns `status: "paused"` with an
+`approval_id`, `POST /approval/{aid}/decide` records approve or reject, and
+`POST /chat/{task_id}/resume` executes the approved action (or cancels the task
+on reject). The resume path is deliberately deterministic — it executes the one
+action that was waiting at the gate rather than re-planning.
 
-What is **not** implemented is a resume endpoint. `apps/api/main.py` accepts a
-`task_id` on the request, but there is no `/approvals/{id}` route that resolves
-an approval and drives the task to completion. Today a paused task is a
-suspended object, not a round trip.
+Durability is now configurable. The repositories have InMemory and Postgres
+implementations; with `AGENT_PG_DSN` they store `agent_approval` and
+`agent_paused_task`, so a restart can resume from the database. Without a DSN
+they stay in process memory, and a multi-worker deployment still needs the
+shared Postgres setup. The LangGraph path is a real `StateGraph` when the
+optional dependency is installed.
 
 </details>
 

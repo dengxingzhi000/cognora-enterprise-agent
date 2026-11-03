@@ -18,10 +18,12 @@ Two things follow from that, and both are enforced by review:
   `finish_received`, `executor_error`, `unknown_action`, `need_approval`,
   `max_iterations` — sets a status, records tokens, emits a trace event, and
   returns. Do not add an early `return` that skips any of those.
-- **Optional dependencies stay optional.** `langgraph`, `redis`, and
-  `tiktoken` are not in `pyproject.toml`'s hard requirements, and the reason is
-  in the file itself: offline CI has to stay green. A missing optional
-  dependency degrades with a warning; it never fails a test run.
+- **Optional dependencies stay optional.** `langgraph`, `mcp`,
+  `prometheus-client`, `opentelemetry-*`, `redis`, and `tiktoken` are not in
+  `pyproject.toml`'s hard requirements, and the reason is in the file itself:
+  offline CI has to stay green. A missing optional dependency degrades with a
+  warning or an explicit skip; it never fails a test run. Integration tests that
+  need a real Postgres are gated on `AGENT_TEST_PG_DSN`.
 
 ## Prerequisites
 
@@ -49,16 +51,19 @@ py -3.12 -m venv .venv312 && .venv312\Scripts\activate && pip install -e . && py
 py -3.13 -m venv .venv313 && .venv313\Scripts\activate && pip install -e . && pytest -q
 ```
 
-The suite must be **128 passing, offline, with no credentials**. If a test you
-added needs a DeepSeek key, an scm-platform instance, or a database, it is
-written wrong — the mock path is the default precisely so that this stays
-possible.
+The suite must be **183 passing, 8 skipped, offline, with no credentials** on a
+bare `pip install -e .` (187/6 once the optional `.[observability,langgraph,mcp]`
+extras are installed). If a test you added needs a DeepSeek key, an
+scm-platform instance, or a database, it is written wrong — the mock path is the
+default precisely so that this stays possible. The only allowed exceptions are
+the integration tests guarded by `skipif` on `AGENT_TEST_PG_DSN` (and on the
+pgvector extension being present).
 
 ## Things that look like improvements but are not
 
 **Do not make `SCM_*` required.** `_use_mock()` returns true when
 `SCM_GATEWAY_URL` is unset. That single line is what lets the suite run with no
-external service. Treating it as a bug to fix would break 128 tests.
+external service. Treating it as a bug to fix would break the offline suite.
 
 **Do not remove the placeholder write tools.** `scm.purchase.create`,
 `scm.order.cancel`, and `scm.stock.adjust` return a fixed `"need approval"`
@@ -76,15 +81,20 @@ mode of the whole agent, so raise it before changing it.
 
 ## Working on the HITL path
 
-The suspend path is implemented: `/chat` returns `status: "paused"` with an
-`approval_id`, and the trace records the transition. The resume endpoint is
-**not** — `/approval/{aid}/decide` and `/chat/{task_id}/resume` are v3
-candidates listed in [CHANGELOG.md](./CHANGELOG.md).
+The round trip is implemented: `/chat` returns `status: "paused"` with an
+`approval_id`, `POST /approval/{aid}/decide` records approve or reject, and
+`POST /chat/{task_id}/resume` executes the approved action or cancels the task.
+`tests/test_hitl.py` starts from the public `/chat` route and runs to completion.
 
-If you build either, the test that matters is an integration test that starts
-from the public `/chat` route and runs to completion. v0.4.1 shipped a blocking
-defect precisely because the unit tests mocked around the real wiring and the
-production path silently never reached `guarded_executor`.
+The resume path is deliberately deterministic: it executes the one action that
+was waiting at the gate rather than re-planning. Keep the approval matching
+strict — an approval authorises exactly one `tool` + `args` pair, is single-use,
+and must never be replayed.
+
+Persistence is repository-based: InMemory is the default, Postgres is used when
+`AGENT_PG_DSN` is set and `scripts/db/agent_schema.sql` has been applied. Do not
+bypass the repository with a module-level dict; a multi-worker deployment
+depends on the shared Postgres implementation.
 
 ## Branch and commit conventions
 

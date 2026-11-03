@@ -7,7 +7,7 @@
 Gateway(FastAPI) → Runtime(Planner/Executor loop, 自研) → Tool Registry → MCP/DB/RAG → Policy/HITL → Workflow → Eval/Obs。后期 LangGraph 重构。
 
 ## 关键决策
-- Python 3.12+, DeepSeek (OpenAI兼容), 远程DB 192.168.80.156 (admin/123456, 库名待确认)
+- Python 3.12+, DeepSeek (OpenAI兼容), 远程DB 192.168.80.156 (<user>/<password>, 库名待确认)
 - 独立仓库 D:\ProgramProject\enterprise-agent，与 scm-platform 同级
 - 自研优先：Stage1手写 loop/state/planner/executor + Mock，再接真模型
 - 企业约束：Chunk带 tenant_id/department/permission/version；Tool前走Policy；高风险走HITL

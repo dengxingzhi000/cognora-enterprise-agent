@@ -36,9 +36,9 @@ pip install -e . && uvicorn apps.api.main:app --port 8762
 
 > [!NOTE]
 > **技术路线：自研 Runtime 优先。** `loop` / `state` / `planner` / `executor`
-> 全部手写并以 TDD 推进，每一层都可独立测试。LangGraph 重构计划作为对照实验，
-> 而不是一开始就绑定框架。三个目标场景：**IT 运维 → 合同合规 → 数据分析**，
-> 目前 `run_it_ops` 已接通。
+> 全部手写并以 TDD 推进，每一层都可独立测试。LangGraph 现在作为可选的对照真图，
+> 而不是一开始就绑定框架。三个场景均已接通：**IT 运维 → 合同合规 → 数据分析**
+> （`run_it_ops`、`review_contract`、`analyze_sales`）。
 
 ---
 
@@ -51,11 +51,16 @@ pip install -e . && uvicorn apps.api.main:app --port 8762
 审批、Workflow 编排，以及 Eval 与 Trace 可观测性。
 
 所有 `SCM_*` 外部依赖在未配置时都会退化为 mock，因此**不配置任何密钥也能完整跑通
-测试与离线链路**。这不是降级妥协，而是为了让 128 个测试完全不依赖任何外部服务而
-刻意设计的。
+测试与离线链路**。这不是降级妥协，而是为了让离线测试完全不依赖任何外部服务而
+刻意设计。裸装 `pip install -e .` 的结果是 **183 passed, 8 skipped**：skip 由
+DSN/pgvector 集成测试与可选依赖探测（`langgraph` 模块、`mcp`、
+`prometheus-client`）构成。
 
-当前 v0.4.1 聚焦 SCM 集成 v2 与 HITL 闭环：测试覆盖 **128 passed**
-（v0.4.0 基线 99 + v0.4.1 新增 29）。
+当前 HEAD 覆盖 HITL 完整往返、Episodic 记忆、审批/挂起持久化、MCP stub、
+向量 RAG、可选可观测性、真实 LangGraph/PG checkpoint 与 fixture 驱动的合同/销售
+场景：裸装 **183 passed, 8 skipped**；装 `.[observability,langgraph,mcp]` 后
+**187 passed, 6 skipped**；配置 `AGENT_TEST_PG_DSN` 指向 `db_agent` 后
+**192 passed, 1 skipped**（唯一 skip 是当前虚拟机没有 pgvector 扩展）。
 
 ## 快速开始
 
@@ -83,7 +88,7 @@ pip install -e .
 copy .env.example .env          # Linux/macOS: cp .env.example .env
                                   # DEEPSEEK_API_KEY 可留空
 
-pytest -q                       # 128 passed
+pytest -q                       # 183 passed, 8 skipped（裸装）
 uvicorn apps.api.main:app --port 8762 --reload
 ```
 
@@ -95,6 +100,9 @@ uvicorn apps.api.main:app --port 8762 --reload
 |---|---|---|
 | `GET` | `/health` | 存活检查——返回 `{"status": "ok", "stage": 1}` |
 | `POST` | `/chat` | 执行一次 agent 任务 |
+| `POST` | `/approval/{approval_id}/decide` | 批准或驳回挂起任务等待的审批单 |
+| `POST` | `/chat/{task_id}/resume` | 执行已批准的动作；被驳回时取消任务 |
+| `GET` | `/metrics` | 安装 `prometheus-client` 时输出 Prometheus 指标；否则 503 并说明 |
 | `GET` | `/docs` | OpenAPI 文档 |
 
 ```bash
@@ -106,6 +114,24 @@ curl -X POST http://localhost:8762/chat \
 正常结束会返回 `reply`、`status`、`task_id`、`trace_id`；有 token 消耗时还带
 `token_usage` 与 `cost`。命中审批门时返回 `status: "paused"`，并附带
 `approval_id`、`approval_tool`、`approval_args`。
+
+HITL 往返是两次调用：
+
+```bash
+curl -X POST http://localhost:8762/approval/apr-1/decide \
+  -H "Content-Type: application/json" \
+  -d '{"decision": "approve", "approver": "mgr-1", "tenant_id": "t1"}'
+
+curl -X POST http://localhost:8762/chat/<task_id>/resume \
+  -H "Content-Type: application/json" -d '{"tenant_id": "t1"}'
+```
+
+`decide` 只记录决定；`resume` 执行被挂起的单个动作并结束任务
+（`status: "done"`，附 `execution_result`），驳回则取消任务
+（`status: "cancelled"`）。两个存储现在都有 repository 抽象：无 DSN 时在进程内
+（重启会丢失待审批单）；设置 `AGENT_PG_DSN` 指向 `db_agent` 并执行
+`scripts/db/agent_schema.sql` 后，审批单与挂起任务落 `agent_approval` /
+`agent_paused_task` 表。
 
 ### 环境变量
 
@@ -123,7 +149,8 @@ curl -X POST http://localhost:8762/chat \
 | `SCM_TIMEOUT_SECONDS` | `5` | 单次请求超时 |
 | `SCM_RETRY_BACKOFF_SECONDS` | `0.3` | 5xx / `ConnectError` / `Timeout` 重试一次前的 sleep |
 | `AGENT_PORT` | `8762` | 网关期望端口 |
-| `POSTGRES_DSN` / `PG_DSN` | 未设置 | 记忆存储；两者都设时 `PG_DSN` 优先 |
+| `AGENT_PG_DSN` | 未设置 | **唯一开关**：审批、挂起任务、Episodic 记忆、checkpoint 都走它；指向 `db_agent`，未设置时 InMemory |
+| `POSTGRES_DSN` / `PG_DSN` | 未设置 | **仅旧版** MemoryStore 使用；不会开启 Agent 持久化 |
 | `PG_OFFLINE` | 未设置 | 无论 DSN 如何都强制记忆存储离线 |
 | `CONTEXT_BUDGET_TOKENS` | `8000` | Assembler 强制总用量不超过该预算 |
 | `CONTEXT_RESERVED_TOKENS` | `1000` | 为回复预留的部分 |
@@ -218,7 +245,7 @@ token、发一条 trace 事件再返回。没有任何东西藏在框架回调�
 保持有效，`approval_id` 回传给调用方。恢复是正常延续，不是异常恢复路径。
 
 **mock 是默认，不是兜底。** `register_scm_tools` 里的 `_use_mock()` 判断的就是
-「`SCM_GATEWAY_URL` 有没有设」。没设就是 mock。正是这一点让 128 个离线测试
+「`SCM_GATEWAY_URL` 有没有设」。没设就是 mock。正是这一点让离线测试
 成立，也让 CI 保持封闭。
 
 ### 项目结构
@@ -240,7 +267,7 @@ enterprise-agent/
 ├── evaluation/              # eval 套件
 ├── observability/           # Tracer 与 trace 存储
 ├── infrastructure/pg/       # connector、schema
-├── tests/                   # 128 个测试
+├── tests/                   # 裸装 183（可选依赖 + DSN 时 192）
 └── docs/superpowers/        # specs/（设计）+ plans/（TDD 计划）
 ```
 
@@ -288,8 +315,9 @@ Eval/Obs → LangGraph 重构
 <details>
 <summary><strong>不配置 DeepSeek API Key 能跑吗？</strong></summary>
 
-能。模型调用走 `echo` 降级，所有 `SCM_*` 工具走 mock 实现。这正是 128 个测试
-不依赖任何外部服务的原因，`pytest -q` 在完全离线的环境下也应全绿。
+能。模型调用走 `echo` 降级，所有 `SCM_*` 工具走 mock 实现。这正是离线测试
+不依赖任何外部服务的原因，`pytest -q` 在完全离线的环境下也应全绿（只有
+DSN 门控与可选依赖探测会 skip）。
 
 </details>
 
@@ -328,13 +356,14 @@ Policy 层有机会审批之前就先抛 `unknown tool`。
 <details>
 <summary><strong>HITL 真的端到端打通了吗？</strong></summary>
 
-挂起与恢复的路径是通的：`/chat` 返回 `status: "paused"` 并带上
-`approval_id`，trace 记录了这次转移。`workflow/durable.py` 与
-`tests/test_durable_langgraph.py` 覆盖了持久化检查点路径。
+HITL 现在是完整往返：`/chat` 返回 `status: "paused"` 与 `approval_id`，
+`POST /approval/{aid}/decide` 记录批准或驳回，
+`POST /chat/{task_id}/resume` 执行已批准的动作（驳回则取消任务）。
+恢复路径刻意做成确定性的——只执行卡在审批门上的那一个动作，不重新规划。
 
-**没有**实现的是恢复接口。`apps/api/main.py` 的请求里接受 `task_id`，
-但并不存在用来结清审批并把任务推进到完成的 `/approvals/{id}` 路由。
-所以目前的挂起任务是「一个挂起态对象」，还不是一次完整往返。
+持久化已可配置：repository 有 InMemory 与 Postgres 两种实现；设置
+`AGENT_PG_DSN` 后审批单与挂起任务落库，重启可恢复；无 DSN 时仍是进程内，
+多 worker 部署需要共享 Postgres。装了可选依赖后 LangGraph 走真实 `StateGraph`。
 
 </details>
 

@@ -342,7 +342,7 @@ Expected: FAIL with "failed: test_parity_still_holds_with_durable_graph not foun
 ```text
 # .env.example 追加（POSTGRES_DSN 已存在，复用；新增 PG_DSN 别名注释）：
 # PG_DSN 与 POSTGRES_DSN 同义，优先读 PG_DSN；库名确认后替换 /postgres
-# PG_DSN=postgresql://admin:123456@192.168.80.156:5432/postgres
+# PG_DSN=postgresql://<user>:<password>@192.168.80.156:5432/postgres
 ```
 
 - [ ] **Step 4: Run test to verify it passes**

@@ -8,9 +8,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
-## [Unreleased]
+## [0.5.0] — 2026-11-03
 
-Nothing yet.
+### Added
+
+**HITL round trip**
+
+- `POST /approval/{approval_id}/decide` records an approve/reject decision
+  (404 unknown, 403 cross-tenant, 409 already decided).
+  `POST /chat/{task_id}/resume` then executes the single approved action and
+  closes the task, or cancels it when the approval was rejected.
+- `ApprovalStore.consume` marks an approval single-use, and
+  `guarded_executor(..., approved_approval_id=...)` only lets that one matching
+  `tool` + `args` pair through the policy gate.
+
+**Episodic memory**
+
+- `agent/memory/episodic.py`: every `AgentTask` status transition is written to
+  `memory_episodic`. Cross-task recall scores by task type, tool names and
+  2-gram/keyword overlap, with tenant isolation. Uses the existing connector
+  when configured; otherwise an in-process list keeps offline tests working.
+- `EpisodicMemoryProvider` is now part of the default context providers and
+  formats recalled episodes as "类似历史任务".
+
+**Durable approval / paused-task state**
+
+- `security/approval.py` now has an `ApprovalRepository` interface with
+  InMemory and Postgres implementations (`agent_approval`).
+- `agent/runtime/paused_tasks.py` persists the whole `AgentState` (including
+  the `AgentTask` snapshot) per `(tenant_id, task_id)` in `agent_paused_task`.
+- New `scripts/db/agent_schema.sql`; the DDL is also idempotently applied by
+  `infrastructure/pg/schema.py`.
+- No `AGENT_PG_DSN` ⇒ automatic in-memory fallback, so local development and CI
+  never need a database. `PG_DSN`/`POSTGRES_DSN` remain legacy MemoryStore
+  configuration and do **not** activate agent persistence.
+
+**MCP server stub**
+
+- `agent/mcp/server.py` exposes `metrics.get`, `logs.search` and `git.diff`
+  through the existing Tool Registry, with MCP-shaped content results.
+- `mcp` is an optional dependency group (`pip install -e .[mcp]`). Without it,
+  the pure spec/call helpers still work; `build_server` raises
+  `MCPUnavailable` instead of crashing the package import.
+
+**RAG embedding / vector retrieval / rerank**
+
+- `knowledge/embedding.py`: deterministic local feature-hashing embeddings,
+  no model or network required.
+- `knowledge/vector_index.py`: in-memory cosine index plus weighted lexical +
+  vector rerank.
+- `knowledge/store.py` now applies tenant/permission filtering **before**
+  vector recall and then reranks; the old lexical behaviour stays available.
+- Optional `knowledge/pgvector_store.py` behind `RAG_PGVECTOR_ENABLED=1` and a
+  DSN. It falls back to the in-memory store when the extension is absent.
+
+**Observability**
+
+- `GET /metrics` with `prometheus-client` (optional group `observability`).
+  Without the package it returns 503 and a message instead of failing startup.
+- `observability/otel.py` adapts trace events to OpenTelemetry spans when the
+  SDK is installed; the in-memory `Tracer` remains the fallback.
+
+**LangGraph real graph**
+
+- `workflow/checkpoint.py` handles the context-manager `PostgresSaver`
+  (`from_conn_string`), adds a connect timeout and closes the connection.
+- Resume uses `Command(resume=...)` on LangGraph 1.x and survives the
+  `__interrupt__` value that `PostgresSaver` writes into `__root__`.
+- Real `StateGraph` tests cover the auto path, pause/resume with a memory
+  saver, and PG checkpoint write/read/resume with `AGENT_TEST_PG_DSN`.
+
+**Scenario implementations**
+
+- `review_contract` accepts a dict or a JSON file, validates required fields,
+  produces structured `findings` (risky clause / amount threshold), retrieves
+  policy from the knowledge base and calls `scm.supplier.get` only when a
+  supplier id is supplied.
+- `analyze_sales` aggregates the repo fixture `workflow/data/sales_week.json`
+  (GMV, orders, AOV, failed payments, per-category change), adds metrics and
+  knowledge tool calls, and returns a structured report. Missing/empty data
+  returns `insufficient_data` instead of inventing numbers.
+
+### Changed
+
+- `PGConnector` normalises `postgresql://` DSNs to the installed psycopg 3
+  driver and translates `?` placeholders to SQLAlchemy named parameters, so
+  real-Postgres reads/writes work instead of only the in-memory connector.
+- `ApprovalStore` and `PausedTaskStore` are module-level singletons in
+  `apps/api/main.py`, backed by repositories rather than raw dicts.
+- `AgentTask.to_dict()` now includes `created_at`/`updated_at` so paused tasks
+  can be reconstructed after a restart.
+
+### Quality
+
+- Bare `pip install -e .`: **183 passed, 8 skipped**. The skips are the
+  real-Postgres/pgvector integration tests (`skipif` on `AGENT_TEST_PG_DSN` /
+  extension availability) plus optional-dependency probes (`langgraph` module,
+  `mcp`, and `prometheus-client`).
+- With the optional `.[observability,langgraph,mcp]` extras (no DSN):
+  **187 passed, 6 skipped** — only the DSN/pgvector integration tests skip.
+- With `AGENT_TEST_PG_DSN=postgresql://<user>:<password>@192.168.0.121:5432/db_agent`:
+  **192 passed, 1 skipped** — the only skip is pgvector because the VM's
+  Postgres image has no `vector` extension.
+- New test files: `test_episodic.py`, `test_approval_persistence.py`,
+  `test_agent_pg_integration.py`, `test_mcp_server.py`, `test_rag.py`,
+  `test_observability_optional.py`, `test_langgraph_real.py`,
+  `test_scenarios_real.py`.
+
+### Activation conditions (not "production ready")
+
+- Postgres approval/paused state: `AGENT_PG_DSN` to `db_agent` + schema SQL.
+- MCP server: install the optional `mcp` group.
+- Prometheus: install `prometheus-client`; OTel: install `opentelemetry-*`.
+- LangGraph: install the optional `langgraph` group; PG checkpoint additionally
+  needs `langgraph-checkpoint-postgres` and a DSN.
+- pgvector: install the `vector` extension in the database and set
+  `RAG_PGVECTOR_ENABLED=1`.
+- Real SCM scenario data: set `SCM_GATEWAY_URL`; without it the tools keep their
+  documented mock behaviour.
+
+### Still deferred
+
+- Multi-process approval/paused state is only as durable as the configured
+  Postgres; no Redis/Kafka outbox has been added.
+- OTLP exporter/collector deployment is not included.
+- pgvector integration test cannot pass on the current VM until the extension is
+  installed; the fallback path is covered.
+- A full "kill the process, start a new process, resume" test still needs a
+  separate harness; the new-saver-instance resume is tested.
 
 ## [0.4.1] — 2026-09-18
 
@@ -182,7 +307,8 @@ The gateway port moved from `:8761` to `:8762` in v0.2.0 so it does not
 collide with the scm-platform gateway, which also uses 8761. `.env.example`
 now carries `AGENT_PORT=8762` and `SCM_GATEWAY_URL=http://localhost:8761`.
 
-[Unreleased]: https://github.com/dengxingzhi000/enterprise-agent/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/dengxingzhi000/cognora-enterprise-agent/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/dengxingzhi000/enterprise-agent/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dengxingzhi000/enterprise-agent/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dengxingzhi000/enterprise-agent/compare/v0.2.0...v0.3.0
