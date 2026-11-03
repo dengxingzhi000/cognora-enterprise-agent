@@ -9,7 +9,7 @@
 **One FastAPI gateway. A hand-written Planner/Executor loop. A fully offline path with no cloud account, no paid dependency, and no credentials.**
 
 [![Build](https://img.shields.io/github/actions/workflow/status/dengxingzhi000/cognora-enterprise-agent/ci.yml?branch=master&style=flat-square&logo=github&label=build)](https://github.com/dengxingzhi000/cognora-enterprise-agent/actions)
-[![Release](https://img.shields.io/github/v/release/dengxingzhi000/cognora-enterprise-agent?style=flat-square&label=v0.5.0)](https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.5.0)
+[![Release](https://img.shields.io/github/v/release/dengxingzhi000/cognora-enterprise-agent?style=flat-square&label=v0.5.1)](https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.5.1)
 [![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white&style=flat-square)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](./LICENSE)
 
@@ -148,6 +148,20 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | 🧾 | **Agent task** | State machine, token usage, per-model cost, status history ring buffer |
 | 🔒 | **Security** | Explicit policy layer; no raw exception text on the wire; tenant-scoped repositories |
 
+## What is live vs conditional
+
+| Status | Capability | What unlocks it |
+| --- | --- | --- |
+| **Always on** | Hand-written runtime, Tool Registry, Policy/HITL transitions, local hashing RAG, in-memory episodic memory, in-memory approvals/paused tasks, in-memory Tracer, fixture scenarios | `pip install -e .` only |
+| **Conditional** | Durable approvals / paused tasks / episodic / checkpoints | `AGENT_PG_DSN` pointing at `db_agent` (5432), schema already applied |
+| **Conditional** | pgvector backend | `RAG_PGVECTOR_ENABLED=1` + a Postgres with the `vector` extension. The verified test instance is `192.168.0.121:5434/db_agent_vector` (`extversion=0.8.7`); **do not use 5433**, which belongs to another project |
+| **Conditional** | MCP server | `pip install -e ".[mcp]"`; `python -m agent.mcp.server` runs stdio only |
+| **Conditional** | Prometheus `/metrics` | `pip install -e ".[observability]"` |
+| **Conditional** | OTLP spans | `pip install -e ".[observability]"` + `OTEL_EXPORTER_OTLP_ENDPOINT` (gRPC 4317 / HTTP 4318); unset keeps the in-memory Tracer |
+| **Conditional** | Real LangGraph graph / PG checkpoints | `pip install -e ".[langgraph]"`; PG checkpoints also need `AGENT_PG_DSN` |
+| **Conditional** | Real SCM tools | `SCM_GATEWAY_URL` + auth settings; otherwise tools stay mocked |
+| **Not claimed** | Production collector/alerting, OTLP backend retention, MCP HTTP daemon, kill-process/restart harness | Not implemented in this repository |
+
 ## Tech stack
 
 | Layer | Components |
@@ -259,6 +273,8 @@ Every `AgentTask` status transition is appended to `memory_episodic`. Recall sco
 
 `KnowledgeStore` filters candidates by tenant and permission **before** embedding and vector scoring. The default embedding provider is local feature hashing, so `pip install -e .` has no model download and no network dependency. `pgvector` is a separate opt-in backend behind `RAG_PGVECTOR_ENABLED=1`; if the extension or DSN is missing it falls back to the in-memory store.
 
+A real pgvector instance was verified separately: `192.168.0.121:5434/db_agent_vector`, extension `vector 0.8.7`. `tests/test_rag.py` passes **7/7** against it and the vector-hit test first returns the ops document. Do not reuse port **5433**, which is occupied by another project. The main persistence DB remains `192.168.0.121:5432/db_agent`; it has no `vector` extension, so the pgvector test there is skipped as designed.
+
 ### Real LangGraph when installed
 
 `workflow/graph_lang.py` runs a genuine `StateGraph` when `langgraph` is installed and the checkpointer is native; otherwise it runs an honest simulation path. Pause/resume uses `Command(resume=...)` on LangGraph 1.x, and `PostgresSaver` checkpoints are persisted in `db_agent`. The hand-rolled `workflow/graph.py` remains the no-dependency path.
@@ -269,7 +285,9 @@ Every `AgentTask` status transition is appended to `memory_episodic`. Recall sco
 
 ### Observability without vendor lock-in
 
-The in-memory `Tracer` always records the task lifecycle. If `prometheus-client` is installed, `GET /metrics` renders counters for task status, tool calls, and trace events. If `opentelemetry-*` plus `opentelemetry-exporter-otlp` are installed **and** `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the same events are mirrored into spans through a real `SimpleSpanProcessor` / OTLP exporter. Otherwise the code logs which path it took and keeps the in-memory Tracer; missing packages or endpoints never fail startup. The endpoint is not a secret, but no DSN/password is ever logged.
+The in-memory `Tracer` always records the task lifecycle. If `prometheus-client` is installed, `GET /metrics` renders counters for task status, tool calls, and trace events. If `opentelemetry-*` plus `opentelemetry-exporter-otlp` are installed **and** `OTEL_EXPORTER_OTLP_ENDPOINT` is set, the same events are mirrored into spans through a real `SimpleSpanProcessor` / OTLP exporter (gRPC 4317 or HTTP 4318; `_protocol_for` picks by port). Otherwise the code logs which path it took and keeps the in-memory Tracer; missing packages or endpoints never fail startup. The endpoint is not a secret, but no DSN/password is ever logged.
+
+The verification collector accepted OTLP metrics; `curl http://192.168.0.121:8889/metrics` exposed `agent_verify_points_total{result="ok"} 3` (HTTP) and `agent_verify_grpc_points_total{result="ok"} 7` (gRPC). The collector is a local HTTP/gRPC receiver with a Prometheus exporter and debug output only — no external backend, retention, or alerting, and it is not claimed as a production deployment.
 
 ## Operations
 
@@ -291,7 +309,7 @@ If `psql` is unavailable, the same DDL can be executed with any Postgres client 
 
 `.github/workflows/ci.yml` runs a Python **3.12 / 3.13** matrix on `master`, installs with `pip install -e .`, and runs `pytest -q -rs`. It cancels superseded runs and uses `permissions: contents: read`. CI intentionally has no `AGENT_TEST_PG_DSN`, `DEEPSEEK_API_KEY`, or `SCM_GATEWAY_URL`, so the Postgres/pgvector integration tests and optional-dependency probes skip by design; the offline suite must stay green.
 
-`master` is protected: pull request required, force pushes and branch deletions disabled, no required review count. `v0.5.0` is an annotated tag; releases are created from tags.
+`master` is protected: pull request required, force pushes and branch deletions disabled, no required review count. `v0.5.1` is an annotated tag; releases are created from tags.
 
 ### Testing
 
@@ -304,13 +322,18 @@ pip install -e . && pytest -q
 pip install -e ".[mcp,observability,langgraph]" && pytest -q
 # 187 passed, 6 skipped
 
-# Real Postgres integration (db_agent)
+# Real Postgres integration (db_agent; no vector extension)
 export AGENT_TEST_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5432/db_agent"
 pytest -q
-# 192 passed, 1 skipped
+# 192 passed, 1 skipped (pgvector)
+
+# Real pgvector integration (db_agent_vector; vector 0.8.7)
+export AGENT_TEST_PG_DSN="postgresql://<user>:<password>@192.168.0.121:5434/db_agent_vector"
+pytest -q
+# 193 passed, 0 skipped
 ```
 
-The remaining skip is pgvector: the current Postgres image does not provide the `vector` extension. The in-memory vector path is covered by unit tests. Integration tests clean their own rows; manual verification rows are removed after the check.
+The `db_agent` skip is pgvector: that Postgres image has no `vector` extension. On `db_agent_vector` the full suite is green and `tests/test_rag.py` is **7 passed, 0 skipped**. Both databases were cleaned after verification (`agent_approval`, `agent_paused_task`, `memory_*`, `agent_knowledge_chunk` = 0 rows).
 
 ## FAQ
 
