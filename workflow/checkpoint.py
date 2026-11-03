@@ -26,9 +26,12 @@ def _unwrap_checkpoint(raw):
         return dict(raw)
     ckpt = getattr(raw, "checkpoint", None)
     if isinstance(ckpt, dict):
-        return dict(ckpt)
+        values = ckpt.get("channel_values")
+        return dict(values) if isinstance(values, dict) else dict(ckpt)
     if isinstance(raw, dict) and isinstance(raw.get("checkpoint"), dict):
-        return dict(raw["checkpoint"])
+        ckpt = raw["checkpoint"]
+        values = ckpt.get("channel_values")
+        return dict(values) if isinstance(values, dict) else dict(ckpt)
     if isinstance(raw, dict):
         return dict(raw)
     return None
@@ -42,8 +45,9 @@ class _SaverAdapter:
     configurable.thread_id）。内存 mirror 仅作离线兜底。
     """
 
-    def __init__(self, inner):
+    def __init__(self, inner, context=None):
         self._inner = inner
+        self._context = context
         self._mem: dict[str, dict] = {}
 
     @property
@@ -90,16 +94,38 @@ class _SaverAdapter:
         v = self._mem.get(thread_id)
         return dict(v) if v is not None else None
 
+    def close(self) -> None:
+        """释放 PostgresSaver 的底层连接（from_conn_string 是上下文管理器）。"""
+        ctx, self._context = self._context, None
+        if ctx is not None:
+            try:
+                ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
+def _with_connect_timeout(dsn: str, seconds: int = 3) -> str:
+    if not dsn or "connect_timeout=" in dsn:
+        return dsn
+    sep = "&" if "?" in dsn else "?"
+    return f"{dsn}{sep}connect_timeout={seconds}"
+
 
 def get_checkpointer(dsn: str | None = None):
-    import os
-    dsn = dsn or os.environ.get("PG_DSN") or os.environ.get("POSTGRES_DSN")
+    from infrastructure.pg.connector import agent_dsn
+    dsn = dsn or agent_dsn()
     if dsn:
         try:
             from langgraph.checkpoint.postgres import PostgresSaver  # type: ignore
-            saver = PostgresSaver.from_conn_string(dsn)
-            saver.setup()
-            return _SaverAdapter(saver)
+            # langgraph-checkpoint-postgres >= 2 returns a context manager.
+            ctx = PostgresSaver.from_conn_string(_with_connect_timeout(dsn))
+            saver = ctx.__enter__()
+            try:
+                saver.setup()
+            except Exception:
+                ctx.__exit__(None, None, None)
+                raise
+            return _SaverAdapter(saver, context=ctx)
         except Exception as exc:
             warnings.warn(f"PostgresSaver unavailable ({exc}), falling back to memory saver")
     try:

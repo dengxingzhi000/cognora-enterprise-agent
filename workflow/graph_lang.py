@@ -25,6 +25,15 @@ def _native_saver_of(store):
     return None
 
 
+def _resume_compiled(compiled, config):
+    """LangGraph 1.x 用 Command(resume=...) 恢复 interrupt；旧版回退 invoke(None)。"""
+    try:
+        from langgraph.types import Command  # type: ignore
+        return compiled.invoke(Command(resume={"approved": True}), config=config)
+    except Exception:
+        return compiled.invoke(None, config=config)
+
+
 def _langgraph_imports():
     try:
         from langgraph.graph import StateGraph, END  # type: ignore
@@ -60,11 +69,19 @@ def _build_real_expense_graph(policy_threshold, native_saver, approvals,
         except Exception:
             return default
 
+    def _has_pending(saver, config) -> bool:
+        try:
+            tup = saver.get_tuple(config) if hasattr(saver, "get_tuple") else None
+            return bool(tup and getattr(tup, "pending_writes", None))
+        except Exception:
+            return False
+
     def _guarded(node: str, fn, state: dict, tid: str) -> dict:
         # Loop guard → failed loop_detected; retry exhaustion → fallback + human chain.
         det = _loop_for(tid)
         if det.visit(node):
             out = dict(state)
+            out.pop("__interrupt__", None)
             out.setdefault("trace", []).append("loop_detected")
             out["_loop_failed"] = True
             out["_failed_node"] = node
@@ -72,12 +89,17 @@ def _build_real_expense_graph(policy_threshold, native_saver, approvals,
         try:
             out = run_with_retry(f"{tid}:{node}", lambda: fn(dict(state)),
                                  store=idem, retries=3, timeout=5.0, backoff=1.0)
+            # PostgresSaver 会把上一轮 interrupt 写回 __root__；节点输出必须剔除，
+            # 否则 resume 结果会被误判为“仍然暂停”。
+            if isinstance(out, dict):
+                out.pop("__interrupt__", None)
             if isinstance(state, dict) and state.get("_fallback_human"):
                 out["_fallback_human"] = True
                 out["need_human"] = True
             return out
         except Exception as e:  # noqa: BLE001 - fallback→human
             out = dict(state)
+            out.pop("__interrupt__", None)
             out.setdefault("trace", []).extend(["timeout", "retry", "fallback", "human"])
             out["_fallback_node"] = node
             out["_fallback_error"] = f"{type(e).__name__}: {e}"
@@ -153,10 +175,21 @@ def _build_real_expense_graph(policy_threshold, native_saver, approvals,
             tid = _tid_of(config)
             cfg = {"configurable": {"thread_id": tid}}
             if state is None:
-                resumed = compiled.invoke(None, config=cfg)
-                decision = "human_review" if (resumed or {}).get("need_human") else "auto_approve"
-                trace = list((resumed or {}).get("trace", [])) + [decision]
-                return {"decision": decision, "state": resumed, "trace": trace}
+                resumed = _resume_compiled(compiled, cfg)
+                still_pending = _has_pending(native_saver, cfg)
+                if isinstance(resumed, dict) and resumed.get("__interrupt__") and still_pending:
+                    # 旧版/未使用 Command 的恢复方式仍停在 interrupt，保持 paused 语义。
+                    _ensure_pending(tid, (resumed.get("expense") or {}))
+                    base = dict(resumed)
+                    inner = base.pop("__interrupt__")
+                    trace = list(base.get("trace", [])) + ["paused"]
+                    return {"decision": "paused_human_review", "state": base,
+                            "trace": trace, "interrupt": inner}
+                base = dict(resumed or {})
+                base.pop("__interrupt__", None)
+                decision = "human_review" if base.get("need_human") else "auto_approve"
+                trace = list(base.get("trace", [])) + [decision]
+                return {"decision": decision, "state": base, "trace": trace}
             exp = state.get("expense", {}) if isinstance(state, dict) else {}
             init = {"expense": exp, "policy_threshold": policy_threshold, "trace": []}
             resumed = compiled.invoke(init, config=cfg)
