@@ -95,6 +95,8 @@ def _startup():
     except Exception as e:  # noqa: BLE001 - 可观测性不能阻断启动
         import warnings
         warnings.warn(f"OTel adapter init failed: {e}")
+    # 启动时随惰性回收一起清理崩溃遗留的 started effect，不新增长驻线程。
+    _reclaim_stale_tool_effects()
 
 
 def _mark_approval_failed(approval_id: str, claim_token: str, summary: str) -> None:
@@ -103,6 +105,18 @@ def _mark_approval_failed(approval_id: str, claim_token: str, summary: str) -> N
         _APPROVALS.fail(approval_id, claim_token, summary)
     except Exception:  # noqa: BLE001 - 标记失败不能掩盖原始错误
         logger.exception("failed to mark approval %s as failed", approval_id)
+
+
+def _reclaim_stale_tool_effects() -> int:
+    """回收崩溃遗留的 started effect；approval 仍有活跃租约时绝不回收。"""
+    try:
+        count = _TOOL_EFFECTS.reclaim_stale_started(approvals=_APPROVALS)
+        if count:
+            logger.warning("reclaimed %d stale started tool effect(s)", count)
+        return count
+    except Exception:  # noqa: BLE001 - 回收失败不阻断启动/本次 resume
+        logger.exception("stale tool effect reclaim failed")
+        return 0
 
 
 def _chat_payload(final: AgentState | None, user_id: str, trace_id: str) -> dict:
@@ -213,6 +227,8 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
                 logger.warning("reclaimed %d expired approval claim(s)", reclaimed)
         except Exception:  # noqa: BLE001 - 回收失败不阻断本次 resume
             logger.exception("approval lease reclaim failed")
+        # 先回收审批租约，再回收 stale effect：后者的「无活跃租约」条件因此成立。
+        _reclaim_stale_tool_effects()
     state = _PAUSED_TASKS.get(tenant, task_id)
     if state is None:
         raise HTTPException(status_code=404, detail="task not found or already completed")

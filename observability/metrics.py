@@ -61,6 +61,9 @@ class MemoryMetrics:
     def inc_approval_heartbeat_failed(self) -> None:
         self._inc("approval_heartbeat_failed_total")
 
+    def inc_tool_effect_reclaimed(self, amount: int = 1) -> None:
+        self._inc("tool_effect_reclaimed_total", amount=amount)
+
     def render(self) -> tuple[bytes, str]:
         lines = []
         with self._lock:
@@ -100,6 +103,9 @@ class _PrometheusMetrics:
         self._heartbeat_failed = self._counter(
             module, "approval_heartbeat_failed_total",
             "Approval heartbeat renewal failures")
+        self._effect_reclaimed = self._counter(
+            module, "tool_effect_reclaimed_total",
+            "Stale started write-tool effects reclaimed")
 
     @staticmethod
     def _counter(module, name: str, doc: str):
@@ -125,6 +131,9 @@ class _PrometheusMetrics:
 
     def inc_approval_heartbeat_failed(self) -> None:
         self._heartbeat_failed.inc()
+
+    def inc_tool_effect_reclaimed(self, amount: int = 1) -> None:
+        self._effect_reclaimed.inc(int(amount))
 
     def render(self) -> tuple[bytes, str]:
         return self._module.generate_latest(), self._module.CONTENT_TYPE_LATEST
@@ -222,5 +231,12 @@ def inc_approval_lease_lost() -> None:
 def inc_approval_heartbeat_failed() -> None:
     try:
         _load_backend().inc_approval_heartbeat_failed()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def inc_tool_effect_reclaimed(amount: int = 1) -> None:
+    try:
+        _load_backend().inc_tool_effect_reclaimed(amount)
     except Exception:  # noqa: BLE001
         pass

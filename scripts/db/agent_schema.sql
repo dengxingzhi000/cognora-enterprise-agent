@@ -60,10 +60,14 @@ CREATE TABLE IF NOT EXISTS agent_tool_effect (
     attempt INTEGER NOT NULL DEFAULT 1,
     result_ref TEXT,
     maybe_side_effect BOOLEAN NOT NULL DEFAULT FALSE,
+    last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, approval_id, tool_name, args_hash)
 );
+
+ALTER TABLE agent_tool_effect
+    ADD COLUMN IF NOT EXISTS last_error TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_agent_tool_effect_approval
     ON agent_tool_effect(approval_id);

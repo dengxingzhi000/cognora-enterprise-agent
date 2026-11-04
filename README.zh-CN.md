@@ -121,6 +121,7 @@ pytest -q
 | `AGENT_APPROVAL_HEARTBEAT_INTERVAL_SECONDS` | 租约 / 3 | 续期间隔覆盖值；不设置则按租约推导，非法值回落推导值。启动时若 `2 * interval >= 租约` 直接失败（见下文） |
 | `AGENT_APPROVAL_RECLAIM_ON_RESUME` | `true` | resume 入口是否惰性回收过期的 `in_progress` claim |
 | `AGENT_TOOL_TIMEOUT_SECONDS` | `120` | 单次工具执行超时（秒）。SCM 写接口通常数秒返回；120 秒覆盖重试与慢查询，同时避免卡死工具永久占用 `in_progress` |
+| `AGENT_TOOL_EFFECT_STALE_SECONDS` | 工具超时 + 租约（默认 `420`） | `started` 写工具 effect 的过期窗口，且只有对应审批不再持有活跃租约时才会被回收。默认推导：`AGENT_TOOL_TIMEOUT_SECONDS`（120）+ `AGENT_APPROVAL_LEASE_SECONDS`（300）= 420 秒。调小会更早解锁崩溃遗留，也更容易把慢但仍存活的工具误判为卡死 |
 | `AGENT_INSTANCE_ID` | `hostname:pid` | claim 写入 `claimed_by` 的实例标识；claim/续期使用它，惰性回收据此避免回收本实例未过期的租约 |
 | `AGENT_TEST_PG_DSN` | 未设置 | 真实 Postgres 集成测试的 opt-in 开关；应用本身不读取 |
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | 本地确定性 embedding，无外部模型 |
@@ -277,11 +278,16 @@ resume 是 claim-first：原子条件 `UPDATE ... WHERE status='approved' AND co
 
 写工具幂等落在 `agent_tool_effect`，唯一键 `(tenant_id, approval_id, tool_name, args_hash)`。工具执行前，resume 用 `INSERT ... ON CONFLICT DO NOTHING` 占位（`status=started`），只有占位成功者才真正调用工具。之后同一 approval + 同一工具 + 同一参数的尝试：看到 `succeeded` 就直接回放存储的结果引用（`sha256:` 摘要，绝不含原始载荷）而**不再执行**；看到 `started` 返回 **409 `tool execution already started`**（不并跑）；看到 `failed` 允许一次重试（`attempt=2`，第三次拒绝）。`args_hash` 是稳定序列化：递归键排序、剔除 `tenant_id`/请求与追踪 ID/时间戳等易变字段、紧凑 JSON、sha256。超时会把 effect 记为 `failed` 且带 `maybe_side_effect=true`，调用方能区分「不确定是否已生效」与「干净失败」。
 
+若崩溃发生在「占位 `started` → 写回结果」之间，effect 会永久停在 `started`，重试一直 409。惰性回收因此也会处理这类行：`started` 超过 `AGENT_TOOL_EFFECT_STALE_SECONDS` 后置为 `failed`、`maybe_side_effect=TRUE`，并写入固定 `last_error` `stale started effect reclaimed`，从而回到一次重试预算（`attempt < 2`）。回收条件必须**同时满足**：`status='started'`、`updated_at` 早于 stale 窗口、对应 approval 已不再活跃（`status <> 'in_progress'` 或 `lease_until <= now()`，或审批行已不存在）。**只要 approval 仍持有活跃租约，就绝不回收**。回收随进程启动和每轮 resume 的 `reclaim_expired_claims()` 一起执行，不新增长驻线程；重复执行幂等（条件更新第二次 0 行）。`tool_effect_reclaimed_total` 统计回收行数。
+
+运维侧用 `scripts/ops/stuck_tool_effects.py` 提供只读视图（tenant、approval、tool、`args_hash` 前 8 位、status、attempt、`maybe_side_effect`、`updated_at`，以及对应 approval 的 status/lease）。选择维护脚本而非 admin 接口：不新增网络面与鉴权面，应用起不来时也能直接连库排查，且绝不打印明文参数或结果。
+
 已知限制：
-- 已覆盖场景的重放上界：**同一 approval + 同一工具 + 同一参数**下，崩溃/重试的 resume 执行写操作 **0 次**（回放 effect 行）。这不是「任意场景零重放」：不同参数视为不同 effect，非本框架发起的工具调用不受保护，超时后被放弃的线程里工具仍可能继续跑完。
+- 已覆盖场景的重放上界：**同一 approval + 同一工具 + 同一参数**下，结果已写回（`succeeded`）时崩溃/重试的 resume 执行写操作 **0 次**（回放 effect 行）。若崩溃发生在结果写回之前，stale 回收会置 `failed(maybe_side_effect=true)` 并允许一次重试——副作用可能已经存在。这不是「任意场景零重放」：不同参数视为不同 effect，非本框架发起的工具调用不受保护，超时后被放弃的线程里工具仍可能继续跑完。
 - 多实例：`claimed_by`（来自 `AGENT_INSTANCE_ID`，缺省 `hostname:pid`）由 claim 写入、续期校验；惰性回收会跳过本实例**自己的未过期**租约。他实例真正过期的租约仍会被回收——这是预期的崩溃恢复，不是缺陷。`claimed_by` **不提供**跨主机 fencing 或 exactly-once 副作用：两个进程共用同一 `AGENT_INSTANCE_ID`、宿主机暂停、或工具已经产生副作用的情况仍不受保护。多实例部署应给每个实例不同 ID，并把这里理解为 at-most-once **尝试**，而不是分布式锁。
 - 墙钟测试：心跳/回收用例（`tests/test_approval_heartbeat.py`、`test_approval_concurrency.py`）依赖真实时间（sleep、租约快进）。它们是回归保护，**不是逻辑不变量**，CI 机器负载高时可能抖动。
 - `execute_with_timeout` 在子线程里执行工具且无法强杀：超时后那个被放弃的线程仍可能在后台跑完。effect 行会记 `maybe_side_effect=true`，但该标志是信息，不是回滚。
+- stale 回收是判断而非证明：一个确实很慢但仍在跑、且审批租约已过期的工具，与崩溃遗留无法区分。调小 `AGENT_TOOL_EFFECT_STALE_SECONDS` 会更快解锁，也会更早误判；默认取「工具超时 + 一个租约」正是为此。
 
 ### Episodic 记忆
 
