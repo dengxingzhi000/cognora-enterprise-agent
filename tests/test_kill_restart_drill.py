@@ -271,14 +271,17 @@ def test_concurrent_resume_only_one_executes(db, tmp_path):
         _cleanup(db, tenant, task_id, aid)
 
 
-# --- case 2: kill mid-tool; live lease blocks retry, expiry reclaims once ---
+# --- case 2: kill mid-tool; live lease and effect placeholder both block retry ---
 
 def test_kill_mid_tool_lease_blocks_retry_then_reclaims_once(db, tmp_path):
-    """A crash mid-tool leaves ``in_progress`` with a live lease.
+    """A crash mid-tool leaves ``in_progress`` plus a ``started`` effect row.
 
     While the lease is live a retry is rejected (409). After the lease expires
-    (fast-forwarded here to keep the drill fast/deterministic) the lazy reclaim
-    makes exactly **one** replay possible — asserted via the counter.
+    (fast-forwarded here to keep the drill fast/deterministic) reclaim returns
+    the row to ``approved``, but the ``started`` effect placeholder now blocks
+    the retry with a conflict: the process died between invoking the tool and
+    recording its outcome, so replaying would risk a second side effect. The
+    counter therefore stays at one invocation.
     """
     tenant = _tenant()
     counter = str(tmp_path / "counter.txt")
@@ -325,15 +328,16 @@ def test_kill_mid_tool_lease_blocks_retry_then_reclaims_once(db, tmp_path):
 
         status, body = _post(standby.base + f"/chat/{task_id}/resume",
                              {"tenant_id": tenant})
-        assert status == 200, body
-        assert body["status"] == "done" and body["executed"] is True, body
+        assert status == 409, body
+        assert body["detail"] == "tool execution already started", body
 
-        # 原始执行 + 至多 1 次重放（重放次数 ≤ 1，副作用非幂等）。
+        # 工具只被调用一次；``started`` 占位让崩溃后的重放降为 0。
         lines = _counter_lines(counter)
-        assert lines.count("invoked") == 2, lines
-        assert lines.count("finished") == 1, lines
-        assert _approval_row(db, aid)["consumed"] is True
-        assert _paused_row(db, tenant, task_id) is None
+        assert lines.count("invoked") == 1, lines
+        assert lines.count("finished") == 0, lines
+        row = _approval_row(db, aid)
+        assert row["status"] == "approved" and row["consumed"] is False, row
+        assert _paused_row(db, tenant, task_id) is not None
     finally:
         app.stop()
         if standby is not None:
@@ -514,7 +518,11 @@ def test_long_tool_run_survives_reclaim_window(db, tmp_path):
 # --- case 6: without the heartbeat the lease still expires ------------------
 
 def test_without_heartbeat_lease_expires_mid_run(db, tmp_path):
-    """心跳关闭时租约照常过期：运行中被回收，complete 条件更新 0 行 → 409。"""
+    """心跳关闭时租约照常过期：运行中被回收，complete 条件更新 0 行 → 409。
+
+    工具本身已经成功并写入 ``succeeded`` effect，因此回收后的重试回放结果而
+    不再调用工具：``invoked`` 保持 1，``executed`` 为 False。
+    """
     tenant = _tenant()
     counter = str(tmp_path / "counter.txt")
     app = UvicornProc(counter, 3.0, lease_seconds=2, heartbeat=False).start()
@@ -545,14 +553,15 @@ def test_without_heartbeat_lease_expires_mid_run(db, tmp_path):
         assert body["detail"] == "approval lease lost during execution", body
         assert _approval_row(db, aid)["consumed"] is False
 
-        # 回收后可重试：这次没有心跳干扰，正常 done。
+        # 回收后可重试：这次没有心跳干扰，正常 done；工具结果被回放而不是重跑。
         status, body = _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
         assert status == 200, body
-        assert body["status"] == "done" and body["executed"] is True, body
+        assert body["status"] == "done" and body["executed"] is False, body
+        assert body["cached"] is True, body
 
         lines = _counter_lines(counter)
-        assert lines.count("invoked") == 2, lines  # 原始执行 + 1 次重放
-        assert lines.count("finished") == 2, lines
+        assert lines.count("invoked") == 1, lines  # 原始执行一次，重试 0 次
+        assert lines.count("finished") == 1, lines
         assert _approval_row(db, aid)["consumed"] is True
     finally:
         app.stop()
