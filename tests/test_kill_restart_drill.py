@@ -1,13 +1,13 @@
-"""Kill/restart drills against a real uvicorn process and a real Postgres.
+"""Kill/restart + two-phase resume drills against a real uvicorn and real Postgres.
 
 Each case boots ``uvicorn drill_app:app`` as a subprocess on a random free port,
-drives ``/chat`` so a high-risk tool is paused for approval, sends ``SIGKILL``
-to the whole process group mid-flight, restarts a brand-new process, and then
-asserts what survived in ``agent_approval`` / ``agent_paused_task``.
+drives ``/chat`` so a high-risk tool is paused for approval, then exercises the
+claim → execute → done/failed state machine, including ``SIGKILL`` of the whole
+process group and a brand-new process.
 
 Only runs when ``AGENT_TEST_PG_DSN`` is set. CI's one-shot ``postgres:16``
-service provides it, and the "Drill cases must run, not skip" workflow step
-fails the job if any of these skip, so they are never silently green.
+service provides it, and the "Concurrency and kill/restart drills must run,
+not skip" step fails the job if any of these skip.
 """
 import json
 import os
@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -31,6 +32,7 @@ pytestmark = pytest.mark.skipif(
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = "payment.execute"
 START_TIMEOUT = 40.0
+LEASE_SECONDS = 2  # 测试用短租约；语义与默认 300s 相同
 
 
 # --- process plumbing -------------------------------------------------------
@@ -44,9 +46,12 @@ def _free_port() -> int:
 class UvicornProc:
     """A real ``uvicorn`` subprocess we can SIGKILL and start again."""
 
-    def __init__(self, counter_path: str, sleep_seconds: float):
+    def __init__(self, counter_path: str, sleep_seconds: float, *, fail: bool = False,
+                 lease_seconds: int = LEASE_SECONDS):
         self.counter = counter_path
         self.sleep = sleep_seconds
+        self.fail = fail
+        self.lease_seconds = lease_seconds
         self.proc = None
         self.port = None
 
@@ -56,6 +61,8 @@ class UvicornProc:
         env["AGENT_PG_DSN"] = DSN
         env["AGENT_DRILL_COUNTER"] = self.counter
         env["AGENT_DRILL_SLEEP"] = str(self.sleep)
+        env["AGENT_DRILL_FAIL"] = "1" if self.fail else "0"
+        env["AGENT_APPROVAL_LEASE_SECONDS"] = str(self.lease_seconds)
         env.pop("AGENT_PG_OFFLINE", None)
         env.pop("PG_OFFLINE", None)
         cmd = [
@@ -119,14 +126,14 @@ class UvicornProc:
 
 # --- HTTP + counter helpers -------------------------------------------------
 
-def _post(url: str, payload: dict):
+def _post(url: str, payload: dict, timeout: float = 60):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, method="POST",
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
@@ -174,7 +181,9 @@ def _paused_row(db, tenant: str, task_id: str):
 
 def _approval_row(db, aid: str):
     return db.fetch_one(
-        "SELECT status, consumed FROM agent_approval WHERE id = ?", (aid,)
+        "SELECT status, consumed, last_error, "
+        "(lease_until IS NOT NULL AND lease_until > now()) AS lease_live "
+        "FROM agent_approval WHERE id = ?", (aid,)
     )
 
 
@@ -208,7 +217,156 @@ def _approve(app: UvicornProc, aid: str, tenant: str):
                  {"decision": "approve", "approver": "mgr-1", "tenant_id": tenant})
 
 
-# --- scenario 1: kill while WAITING_APPROVAL --------------------------------
+# --- case 1: two concurrent resumes, exactly one executes -------------------
+
+def test_concurrent_resume_only_one_executes(db, tmp_path):
+    tenant = _tenant()
+    counter = str(tmp_path / "counter.txt")
+    app = UvicornProc(counter, 3.0).start()
+    task_id = aid = None
+    try:
+        task_id, aid = _pause_for_approval(app, tenant)
+        status, body = _approve(app, aid, tenant)
+        assert status == 200 and body["status"] == "approved", body
+
+        barrier = threading.Barrier(2)
+        results: list[int] = []
+
+        def _resume():
+            barrier.wait()
+            status, body = _post(app.base + f"/chat/{task_id}/resume",
+                                 {"tenant_id": tenant})
+            results.append(status)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for _ in range(2):
+                pool.submit(_resume)
+
+        # claim is atomic: exactly one 200, the other 409.
+        assert sorted(results) == [200, 409], results
+        lines = _counter_lines(counter)
+        assert lines.count("invoked") == 1, lines
+        assert lines.count("finished") == 1, lines
+
+        row = _approval_row(db, aid)
+        assert row["status"] == "done" and row["consumed"] is True, row
+        status, body = _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
+        assert status == 404, body
+        assert _counter_lines(counter).count("invoked") == 1
+    finally:
+        app.stop()
+        _cleanup(db, tenant, task_id, aid)
+
+
+# --- case 2: kill mid-tool; live lease blocks retry, expiry reclaims once ---
+
+def test_kill_mid_tool_lease_blocks_retry_then_reclaims_once(db, tmp_path):
+    """A crash mid-tool leaves ``in_progress`` with a live lease.
+
+    While the lease is live a retry is rejected (409). After the lease expires
+    (fast-forwarded here to keep the drill fast/deterministic) the lazy reclaim
+    makes exactly **one** replay possible — asserted via the counter.
+    """
+    tenant = _tenant()
+    counter = str(tmp_path / "counter.txt")
+    app = UvicornProc(counter, 3.0).start()
+    standby = None
+    task_id = aid = None
+    try:
+        task_id, aid = _pause_for_approval(app, tenant)
+        status, body = _approve(app, aid, tenant)
+        assert status == 200 and body["status"] == "approved", body
+
+        # Pre-warm a second process so the post-kill retry needs no restart wait
+        # (keeps the 2 s lease window deterministic). It is a standby, not a
+        # multi-instance ownership test.
+        standby = UvicornProc(counter, 3.0).start()
+
+        resume_errors: list[Exception] = []
+
+        def _resume():
+            try:
+                _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
+            except Exception as e:  # noqa: BLE001 - the process dies under us
+                resume_errors.append(e)
+
+        worker = threading.Thread(target=_resume, daemon=True)
+        worker.start()
+        assert _wait_for_line(counter, "invoked", timeout=10), "tool never started"
+        app.kill9()
+        worker.join(timeout=10)
+        assert _counter_lines(counter).count("finished") == 0
+
+        row = _approval_row(db, aid)
+        assert row["status"] == "in_progress", row
+        assert row["consumed"] is False, row
+        assert row["lease_live"] is True, row  # 租约未过期
+
+        status, body = _post(standby.base + f"/chat/{task_id}/resume",
+                             {"tenant_id": tenant})
+        assert status == 409, body  # claim held by the dead process until lease expiry
+
+        # 等价于等待租约过期（测试里不真的睡 300s）。
+        db.execute("UPDATE agent_approval SET lease_until = now() - INTERVAL '1 second' "
+                   "WHERE id = ?", (aid,))
+
+        status, body = _post(standby.base + f"/chat/{task_id}/resume",
+                             {"tenant_id": tenant})
+        assert status == 200, body
+        assert body["status"] == "done" and body["executed"] is True, body
+
+        # 原始执行 + 至多 1 次重放（重放次数 ≤ 1，副作用非幂等）。
+        lines = _counter_lines(counter)
+        assert lines.count("invoked") == 2, lines
+        assert lines.count("finished") == 1, lines
+        assert _approval_row(db, aid)["consumed"] is True
+        assert _paused_row(db, tenant, task_id) is None
+    finally:
+        app.stop()
+        if standby is not None:
+            standby.stop()
+        _cleanup(db, tenant, task_id, aid)
+
+
+# --- case 3: tool raises → failed, sanitized summary, no resume -------------
+
+def test_tool_failure_marks_failed_and_blocks_resume(db, tmp_path):
+    tenant = _tenant()
+    counter = str(tmp_path / "counter.txt")
+    app = UvicornProc(counter, 0, fail=True).start()
+    task_id = aid = None
+    try:
+        task_id, aid = _pause_for_approval(app, tenant)
+        status, body = _approve(app, aid, tenant)
+        assert status == 200 and body["status"] == "approved", body
+
+        status, body = _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
+        assert status == 502, body
+        assert body["detail"] == "approved action failed to execute", body
+        assert "boom" not in json.dumps(body), body
+
+        row = db.fetch_one(
+            "SELECT status, last_error FROM agent_approval WHERE id = ?", (aid,))
+        assert row["status"] == "failed", row
+        err = (row["last_error"] or "")
+        assert err.startswith("tool error "), err
+        assert "Traceback" not in err and "RuntimeError" not in err, err
+        assert "boom" not in err and "/" not in err and "\\" not in err, err
+
+        lines = _counter_lines(counter)
+        assert lines.count("invoked") == 1, lines
+        assert lines.count("finished") == 0, lines
+
+        # failed is terminal for resume; the paused row is kept for inspection.
+        status, body = _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
+        assert status == 409, body
+        assert _counter_lines(counter).count("invoked") == 1
+    finally:
+        app.stop()
+        _cleanup(db, tenant, task_id, aid)
+
+
+# --- case 4a: kill while WAITING_APPROVAL ------------------------------------
 
 def test_kill_while_waiting_approval_then_resume(db, tmp_path):
     tenant = _tenant()
@@ -241,76 +399,19 @@ def test_kill_while_waiting_approval_then_resume(db, tmp_path):
         assert status == 200, body
         assert body["status"] == "done" and body["executed"] is True, body
 
-        # The approved action ran exactly once after recovery.
         lines = _counter_lines(counter)
         assert lines.count("invoked") == 1, lines
         assert lines.count("finished") == 1, lines
 
         assert _paused_row(db, tenant, task_id) is None
         assert _approval_row(db, aid)["consumed"] is True
+        assert _approval_row(db, aid)["status"] == "done"
     finally:
         app.stop()
         _cleanup(db, tenant, task_id, aid)
 
 
-# --- scenario 2: kill while the tool is executing ---------------------------
-
-def test_kill_during_tool_execution_is_retryable_not_consumed_without_result(db, tmp_path):
-    """The approval must not be left consumed without a result.
-
-    Current implementation executes the tool first and consumes the approval
-    afterwards, so a kill mid-tool leaves ``approved`` + ``consumed=FALSE``:
-    retryable, but the side effect is replayed (asserted below and reported as
-    a known gap). It is *not* left in the "consumed but no result" state.
-    """
-    tenant = _tenant()
-    counter = str(tmp_path / "counter.txt")
-    app = UvicornProc(counter, 5.0).start()
-    task_id = aid = None
-    try:
-        task_id, aid = _pause_for_approval(app, tenant)
-        status, body = _approve(app, aid, tenant)
-        assert status == 200 and body["status"] == "approved", body
-
-        resume_errors: list[Exception] = []
-
-        def _resume():
-            try:
-                _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
-            except Exception as e:  # noqa: BLE001 - the process dies under us
-                resume_errors.append(e)
-
-        worker = threading.Thread(target=_resume, daemon=True)
-        worker.start()
-        assert _wait_for_line(counter, "invoked", timeout=10), "tool never started"
-        app.kill9()
-        worker.join(timeout=10)
-        assert _counter_lines(counter).count("finished") == 0
-
-        # --- restart ---
-        app = UvicornProc(counter, 5.0).start()
-
-        row = _approval_row(db, aid)
-        assert row["status"] == "approved", row
-        assert row["consumed"] is False, f"bad state: consumed without result {row}"
-        assert _paused_row(db, tenant, task_id) is not None
-
-        # Retry completes the approved action; the counter shows a replay.
-        status, body = _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
-        assert status == 200, body
-        assert body["status"] == "done" and body["executed"] is True, body
-
-        lines = _counter_lines(counter)
-        assert lines.count("invoked") == 2, lines  # killed attempt + retry
-        assert lines.count("finished") == 1, lines
-        assert _approval_row(db, aid)["consumed"] is True
-        assert _paused_row(db, tenant, task_id) is None
-    finally:
-        app.stop()
-        _cleanup(db, tenant, task_id, aid)
-
-
-# --- scenario 3: kill after approval, before resume ------------------------
+# --- case 4b: kill after approval, before resume ---------------------------
 
 def test_kill_after_approval_resume_runs_once(db, tmp_path):
     tenant = _tenant()

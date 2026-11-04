@@ -116,6 +116,8 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | `AGENT_PORT` | `8762` | Gateway port |
 | `AGENT_PG_DSN` | unset | **The only switch** for approvals, paused tasks, episodic memory, and checkpoints; point it at `db_agent` |
 | `AGENT_PG_OFFLINE` | unset | Force agent persistence and the memory store offline regardless of DSN |
+| `AGENT_APPROVAL_LEASE_SECONDS` | `300` | Lease held by the resume request that atomically claimed an approval; expired claims are reclaimed on the next resume |
+| `AGENT_APPROVAL_RECLAIM_ON_RESUME` | `true` | Lazily reclaim expired `in_progress` claims at the resume entry point |
 | `AGENT_TEST_PG_DSN` | unset | Opt-in trigger for real-Postgres integration tests; never read by the application |
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | Local deterministic embedding; no external model required |
 | `RAG_PGVECTOR_ENABLED` | unset | `1` enables the optional pgvector backend (needs the `vector` extension and a DSN) |
@@ -139,7 +141,7 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | 🧰 | **Tool registry** | One dispatch path for built-in ops tools, SCM REST tools, and MCP |
 | 🧩 | **MCP server** | `metrics.get`, `logs.search`, `git.diff` exposed with MCP-shaped results; `mcp` is optional |
 | 🛡️ | **Policy** | Read ⇒ allow, write ⇒ approval, unknown ⇒ deny; cross-tenant writes are rejected |
-| ✋ | **Durable HITL** | Single-use approvals and paused `AgentState` survive a restart when `AGENT_PG_DSN` points at `db_agent` |
+| ✋ | **Durable HITL** | Claim-then-execute approvals (atomic claim + lease + lazy reclaim) and paused `AgentState` survive a restart when `AGENT_PG_DSN` points at `db_agent` |
 | 🧠 | **Memory** | Five layers plus real episodic recall (task type, tools, lexical similarity); tenant isolation before ranking |
 | 📚 | **Retrieval** | Deterministic hashing embeddings, in-memory cosine index, weighted lexical/vector rerank; pgvector is opt-in |
 | 🔀 | **Workflow** | Hand-rolled durable guards (timeout / retry / idempotency / loop limit) and an optional real LangGraph `StateGraph` |
@@ -153,14 +155,14 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | Status | Capability | What unlocks it | Verification |
 | --- | --- | --- | --- |
 | **Always on** | Hand-written runtime, Tool Registry, Policy/HITL transitions, local hashing RAG, in-memory episodic memory, in-memory approvals/paused tasks, in-memory Tracer, fixture scenarios | `pip install -e .` only | CI (unit/fixture) |
-| **Conditional** | Durable approvals / paused tasks / episodic / checkpoints | `AGENT_PG_DSN` pointing at `db_agent` (5432), schema already applied | Real PG `db_agent` verified manually; CI skips without `AGENT_TEST_PG_DSN` |
+| **Conditional** | Durable approvals / paused tasks / episodic / checkpoints | `AGENT_PG_DSN` pointing at `db_agent` (5432), schema already applied | CI: real-PG concurrency, lease reclaim and kill/restart drills |
 | **Conditional** | pgvector backend | `RAG_PGVECTOR_ENABLED=1` + a Postgres with the `vector` extension. The verified test instance is `192.168.0.121:5434/db_agent_vector` (`extversion=0.8.7`); **do not use 5433**, which belongs to another project | Real instance verified manually (5434, vector 0.8.7); CI exercise uses the in-memory index only |
 | **Conditional** | MCP server | `pip install -e ".[mcp]"`; `python -m agent.mcp.server` runs stdio only | Tool registration is unit-tested in CI; the stdio launch is manual and is not a deployed daemon |
 | **Conditional** | Prometheus `/metrics` | `pip install -e ".[observability]"` | CI unit tests cover the 200 and 503 responses |
 | **Conditional** | OTLP spans | `pip install -e ".[observability]"` + `OTEL_EXPORTER_OTLP_ENDPOINT` (gRPC 4317 / HTTP 4318); unset keeps the in-memory Tracer | Exporter wiring is unit-tested in CI; real collector delivery was verified manually (4317/4318, metrics on 8889); no vendor backend |
 | **Conditional** | Real LangGraph graph / PG checkpoints | `pip install -e ".[langgraph]"`; PG checkpoints also need `AGENT_PG_DSN` | Graph tests run in CI with extras; PG checkpoints were verified manually and skip without a DSN |
 | **Conditional** | Real SCM tools | `SCM_GATEWAY_URL` + auth settings; otherwise tools stay mocked | Mock path runs in CI; a real gateway is not verified by this repository |
-| **Not claimed** | Production collector/alerting, OTLP backend retention, MCP HTTP daemon, kill-process/restart harness | Not implemented in this repository | — |
+| **Not claimed** | Production collector/alerting, OTLP backend retention, MCP HTTP daemon; VM real-environment drills, multi-instance ownership, tool-level idempotency | The CI drills use a runner-local Postgres and bounded single-process restarts; they do not prove cross-host ownership or exactly-once side effects | — |
 
 **Verification labels:** **CI** means every green build exercises the path.
 **Manual** means it was run once against the instance named in the row and is

@@ -1,10 +1,12 @@
-"""并发回归：consume 单次生效 / approve+reject 冲突 / 挂起任务 upsert 不重复。
+"""并发回归：claim 单次生效 / approve+reject 冲突 / 租约回收 / 挂起任务 upsert 不重复。
 
 仅在 ``AGENT_TEST_PG_DSN`` 存在时运行。CI 用一次性 Postgres service（trust 认证）
-提供该 DSN，并由 "Concurrency cases must run, not skip" 步骤保证这些用例真的执行。
+提供该 DSN，并由 "Concurrency and kill/restart drills must run, not skip" 步骤
+保证这些用例真的执行。
 """
 import os
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
@@ -51,8 +53,8 @@ def _cleanup(connector, *, approval_id=None, tenant=None, task_id=None) -> None:
         )
 
 
-def test_concurrent_consume_only_one_wins(store, connector):
-    """同一 approval 被 4 个线程同时 consume：恰好 1 个成功。"""
+def test_concurrent_claim_only_one_wins(store, connector):
+    """同一 approval 被 4 个线程同时 claim：恰好 1 个成功，其余 409 语义。"""
     tenant = _tenant()
     aid = store.request({"tenant_id": tenant, "user_id": "u1"},
                         TOOL, {"sku": "X", "tenant_id": tenant})
@@ -62,7 +64,7 @@ def test_concurrent_consume_only_one_wins(store, connector):
     def worker(_):
         barrier.wait()
         try:
-            store.consume(aid)
+            store.claim(aid)
             return "ok"
         except ValueError:
             return "conflict"
@@ -72,7 +74,31 @@ def test_concurrent_consume_only_one_wins(store, connector):
             results = list(pool.map(worker, range(4)))
         assert results.count("ok") == 1, results
         assert results.count("conflict") == 3, results
-        assert store.get(aid)["consumed"] is True
+        assert store.get(aid)["status"] == "in_progress"
+        assert store.get(aid)["consumed"] is False
+        assert store.complete(aid)["consumed"] is True
+        assert store.get(aid)["status"] == "done"
+    finally:
+        _cleanup(connector, approval_id=aid)
+
+
+def test_expired_lease_is_reclaimed(store, connector):
+    """租约 1 秒：过期后 reclaim_expired_claims 退回 approved，可再次 claim。"""
+    tenant = _tenant()
+    aid = store.request({"tenant_id": tenant, "user_id": "u1"},
+                        TOOL, {"sku": "X", "tenant_id": tenant})
+    store.approve(aid, "mgr-1")
+    try:
+        store.claim(aid, lease_seconds=1)
+        assert store.get(aid)["status"] == "in_progress"
+
+        time.sleep(1.5)
+        assert store.reclaim_expired_claims() >= 1
+        assert store.get(aid)["status"] == "approved"
+
+        store.claim(aid, lease_seconds=60)
+        assert store.get(aid)["status"] == "in_progress"
+        assert store.complete(aid)["status"] == "done"
     finally:
         _cleanup(connector, approval_id=aid)
 
