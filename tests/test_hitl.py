@@ -247,7 +247,9 @@ def test_approval_claim_blocks_replay():
     store = ApprovalStore()
     aid = store.request(user, "scm.purchase.create", {"sku": "X"})
     store.approve(aid, "mgr-1")
-    assert store.claim(aid)["status"] == "in_progress"
-    assert store.complete(aid)["consumed"] is True
+    claimed = store.claim(aid)
+    assert claimed["status"] == "in_progress"
+    token = claimed["claim_token"]
+    assert token and store.complete(aid, token)["consumed"] is True
     with pytest.raises(ValueError):
         store.claim(aid)

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS agent_approval (
     consumed_at TIMESTAMPTZ,
     claimed_at TIMESTAMPTZ,
     lease_until TIMESTAMPTZ,
+    claim_token UUID,
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -42,6 +43,9 @@ ALTER TABLE agent_approval
 
 ALTER TABLE agent_approval
     ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ;
+
+ALTER TABLE agent_approval
+    ADD COLUMN IF NOT EXISTS claim_token UUID;
 
 ALTER TABLE agent_approval
     ADD COLUMN IF NOT EXISTS last_error TEXT;

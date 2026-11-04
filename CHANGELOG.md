@@ -8,6 +8,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [0.5.7] — 2026-11-04
+
+The heartbeat's companion fixes: a claimant identity, a tool-level deadline, a
+startup margin check, and counters that make reclaim/lease-loss visible.
+
+### Added
+
+- `agent_approval.claim_token UUID` (idempotent column + `ALTER TABLE ... ADD
+  COLUMN IF NOT EXISTS`). `claim()` generates a UUID and stores it; `renew()`,
+  `complete()` and `fail()` all update with `AND claim_token = $token`. **0 rows
+  affected** writes no terminal state and maps to **409 `approval lease lost`**.
+  A claim on a row already held by someone else (`in_progress` with a live lease)
+  is rejected with 409 and never overwrites the existing token.
+- `AGENT_TOOL_TIMEOUT_SECONDS` (default **120 s**). SCM write calls normally
+  return in seconds; 120 s covers retries and slow queries while stopping a stuck
+  tool from holding `in_progress` forever. On expiry the response is **504
+  `approved action timed out`**, the approval becomes `failed` with the fixed
+  `last_error = "tool timeout"` (no stack/path), and the heartbeat stops in
+  `finally`.
+- Prometheus counters `approval_reclaimed_total`, `approval_lease_lost_total`
+  and `approval_heartbeat_failed_total`. When `prometheus-client` is absent the
+  in-memory backend still counts and renders the same Prometheus text at
+  `/metrics` (no more 503).
+
+### Changed
+
+- `DEFAULT_HEARTBEAT_MAX_FAILURES` reduced from 3 to **2** (2 × lease/3 = 2/3
+  lease < lease).
+- Startup now validates `max_failures * interval < lease` and **fails fast**
+  with a `HeartbeatConfigError` naming all three values. Chosen over silently
+  shrinking the interval because this margin decides lease correctness: a
+  visible misconfiguration is safer than a hidden, quieter heartbeat.
+
+### Testing
+
+No skips: the offline cases (threshold rejection, tool timeout, counters, the
+frozen-heartbeat A/B scenario) and the Postgres concurrency/drill cases all run.
+The gate keeps the "skipped is failure" rule.
+
+- Frozen heartbeat: A claims and blocks in the tool; its lease is fast-forwarded,
+  B reclaims and re-claims with a new token; A's `complete` returns **409** and
+  the row's `status` / `consumed` / `claim_token` stay exactly at B's values.
+- Stuck tool (6 s tool, 1 s timeout, 2 s lease): response 504, row `failed`
+  with `last_error='tool timeout'`, never `in_progress` afterwards.
+- Counters after one reclaim and one lost lease: `approval_reclaimed_total 1`,
+  `approval_lease_lost_total 1`; after an injected renew failure:
+  `approval_heartbeat_failed_total 1`, `approval_lease_lost_total 2`.
+- v0.5.6's 13 gate cases stay green; `invoked` assertions unchanged.
+
+### Known limitations (documented, not fixed here)
+
+- Replay is bounded at **one per crash**; repeated crashes accumulate.
+- The heartbeat/reclaim tests depend on wall-clock time and are regression
+  guards, not logical invariants.
+- Multi-instance ownership (`claimed_by`) is still not implemented.
+- A timed-out tool runs on a worker thread that cannot be killed; the abandoned
+  thread may finish in the background.
+
 ## [0.5.6] — 2026-11-04
 
 Execution-time lease heartbeat. The v0.5.5 design only worked if the lease

@@ -11,8 +11,9 @@ def test_approval_store_inmemory_repository_roundtrip():
     assert store.get(aid)["status"] == "pending"
     assert store.approve(aid, "mgr-1")["status"] == "approved"
     assert store.list_items()[0]["id"] == aid
-    assert store.claim(aid)["status"] == "in_progress"
-    assert store.complete(aid)["consumed"] is True
+    claimed = store.claim(aid)
+    assert claimed["status"] == "in_progress"
+    assert store.complete(aid, claimed["claim_token"])["consumed"] is True
 
 
 def test_build_approval_store_falls_back_without_dsn(monkeypatch):

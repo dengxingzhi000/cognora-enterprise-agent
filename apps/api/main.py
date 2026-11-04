@@ -8,7 +8,12 @@ from pydantic import BaseModel
 from agent.runtime import loop as _runtime_loop
 from agent.runtime.state import AgentState
 from agent.runtime.llm_planner import build_deepseek_planner, get_default_client
-from agent.tools.executor import guarded_executor
+from agent.tools.executor import (
+    ToolTimeout,
+    execute_with_timeout,
+    guarded_executor,
+    tool_timeout_seconds,
+)
 from infrastructure.pg.connector import get_agent_connector, get_connector
 from infrastructure.pg.schema import ensure_schema
 from observability.tracing import Tracer
@@ -21,6 +26,7 @@ from security.approval import (
     build_approval_store,
     reclaim_on_resume_enabled,
     start_lease_heartbeat,
+    validate_heartbeat_settings,
 )
 from security.policy import PolicyEngine
 from agent.runtime.paused_tasks import build_paused_task_store
@@ -60,7 +66,7 @@ def health():
 
 @app.get("/metrics")
 def metrics_endpoint():
-    """Prometheus 文本指标；未安装 prometheus-client 时返回 503 并说明原因。"""
+    """Prometheus 文本指标；无 prometheus-client 时用内存计数器（同样可读）。"""
     try:
         payload, content_type = _metrics.render_metrics()
     except _metrics.MetricsUnavailable as e:
@@ -70,6 +76,8 @@ def metrics_endpoint():
 
 @app.on_event("startup")
 def _startup():
+    # 余量约束不满足直接启动失败：租约保护失效属于正确性问题，不接受静默降级。
+    validate_heartbeat_settings()
     try:
         ensure_schema(get_agent_connector() or get_connector())
     except Exception as e:
@@ -82,10 +90,10 @@ def _startup():
         warnings.warn(f"OTel adapter init failed: {e}")
 
 
-def _mark_approval_failed(approval_id: str, summary: str) -> None:
+def _mark_approval_failed(approval_id: str, claim_token: str, summary: str) -> None:
     """工具/执行失败时把审批置为 failed；摘要已脱敏，异常全文只进日志。"""
     try:
-        _APPROVALS.fail(approval_id, summary)
+        _APPROVALS.fail(approval_id, claim_token, summary)
     except Exception:  # noqa: BLE001 - 标记失败不能掩盖原始错误
         logger.exception("failed to mark approval %s as failed", approval_id)
 
@@ -247,23 +255,33 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
     # 进程崩溃后行停在 in_progress，心跳停止 → 租约到期才允许重试（最多重放一次）。
     lease = approval_lease_seconds()
     try:
-        _APPROVALS.claim(aid, lease)
+        claimed = _APPROVALS.claim(aid, lease)
     except ApprovalConflict:
         raise HTTPException(status_code=409, detail="approval is already claimed")
+    token = claimed["claim_token"]
 
     tool = item["tool"]
     args = item["args"]
     # 两阶段执行期：心跳每隔 lease/3 续期一次，租约因此不再需要大于工具时长。
-    heartbeat = start_lease_heartbeat(_APPROVALS, aid, lease)
+    heartbeat = start_lease_heartbeat(_APPROVALS, aid, token, lease)
+    timeout = tool_timeout_seconds()
     try:
-        obs = guarded_executor(
-            {"action": "call_tool", "tool": tool, "args": args},
-            state, user=user, policy=PolicyEngine(),
-            approvals=_APPROVALS, approved_approval_id=aid,
+        obs = execute_with_timeout(
+            lambda: guarded_executor(
+                {"action": "call_tool", "tool": tool, "args": args},
+                state, user=user, policy=PolicyEngine(),
+                approvals=_APPROVALS, approved_approval_id=aid,
+            ),
+            timeout,
         )
+    except ToolTimeout:
+        # 线程无法强杀：放弃本次执行、写固定文案的终态，心跳在 finally 停止。
+        logger.warning("approved action timed out after %ss", timeout)
+        _mark_approval_failed(aid, token, "tool timeout")
+        raise HTTPException(status_code=504, detail="approved action timed out")
     except Exception:  # noqa: BLE001 - 执行异常只进日志，不向调用方回显
         logger.exception("approved action failed")
-        _mark_approval_failed(aid, "execution failed")
+        _mark_approval_failed(aid, token, "execution failed")
         raise HTTPException(status_code=502, detail="approved action failed to execute")
     finally:
         # 工具返回或抛异常后必须停掉续期循环，避免线程泄漏。
@@ -277,21 +295,22 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
 
     # 若放行失败，guarded_executor 会写入一个新的 approval_id；此时不动原审批单。
     if state.context.get("approval_id") != aid:
-        _mark_approval_failed(aid, "approval does not match pending action")
+        _mark_approval_failed(aid, token, "approval does not match pending action")
         raise HTTPException(status_code=409, detail="approval does not match pending action")
 
     result = str(obs.get("result", ""))
     if result.startswith("tool error ") or result.startswith("unknown tool:"):
         # 工具失败的 Observation 已只含工具名（无异常文本/栈），直接作为脱敏摘要。
-        _mark_approval_failed(aid, result)
+        _mark_approval_failed(aid, token, result)
         raise HTTPException(status_code=502, detail="approved action failed to execute")
 
-    # 两阶段第二步：成功才置 done + consumed。条件更新 0 行说明租约已被回收
-    #（心跳关闭/丢失期间发生），此时不覆盖他人的 claim。
+    # 两阶段第二步：成功才置 done + consumed。条件更新 0 行（含 claim_token 不匹配）
+    # 说明租约已被回收/换主，此时不覆盖他人的 claim。
     try:
-        _APPROVALS.complete(aid)
+        _APPROVALS.complete(aid, token)
     except ValueError:
         logger.warning("approval %s could not be completed; lease lost", aid)
+        _metrics.inc_approval_lease_lost()
         raise HTTPException(status_code=409, detail="approval lease lost during execution")
     state.observations.append(obs)
     state.messages.append({"role": "observation", "content": str(obs)})

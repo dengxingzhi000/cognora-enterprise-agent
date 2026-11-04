@@ -17,7 +17,12 @@ from itertools import count
 logger = logging.getLogger(__name__)
 
 DEFAULT_LEASE_SECONDS = 300
-DEFAULT_HEARTBEAT_MAX_FAILURES = 3
+# 2 次心跳失败 * 默认间隔（租约/3）= 2/3 租约 < 租约，满足下方的余量约束。
+DEFAULT_HEARTBEAT_MAX_FAILURES = 2
+
+
+class HeartbeatConfigError(ValueError):
+    """心跳配置不满足余量约束；启动阶段直接失败，避免租约被误回收。"""
 
 
 def approval_lease_seconds() -> int:
@@ -53,6 +58,30 @@ def heartbeat_interval_seconds(lease_seconds: int) -> float:
         return fallback
 
 
+def validate_heartbeat_settings(lease_seconds: int | None = None,
+                                interval: float | None = None,
+                                max_failures: int | None = None) -> None:
+    """启动校验：``max_failures * interval`` 必须严格小于租约，否则拒绝启动。
+
+    心跳缺席时租约最多在 ``max_failures * interval`` 内被判定丢失；若该时长
+    >= 租约，判定「丢失」时行可能已经过期而被他人回收，阈值就失去意义。
+    选择 fail-fast 而不是自动缩小 interval：静默降级会让配置错误不可见，
+    而这段窗口直接决定租约正确性。
+    """
+    if not approval_heartbeat_enabled():
+        return
+    lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+    interval = (heartbeat_interval_seconds(lease)
+                if interval is None else max(0.01, float(interval)))
+    failures = DEFAULT_HEARTBEAT_MAX_FAILURES if max_failures is None else max(1, int(max_failures))
+    if failures * interval >= lease:
+        raise HeartbeatConfigError(
+            "invalid approval heartbeat config: "
+            f"max_failures({failures}) * interval({interval}s) = {failures * interval}s "
+            f"must be < lease({lease}s); lower AGENT_APPROVAL_HEARTBEAT_INTERVAL_SECONDS "
+            "or raise AGENT_APPROVAL_LEASE_SECONDS (or disable the heartbeat)")
+
+
 class ApprovalConflict(ValueError):
     """并发下审批状态已被其他请求改写；调用方应按 409 处理。"""
 
@@ -63,9 +92,10 @@ class ApprovalRepository:
     def approve(self, approval_id: str, approver: str) -> dict: ...
     def reject(self, approval_id: str, approver: str) -> dict: ...
     def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict: ...
-    def renew(self, approval_id: str, lease_seconds: int | None = None) -> bool: ...
-    def complete(self, approval_id: str) -> dict: ...
-    def fail(self, approval_id: str, last_error: str) -> dict: ...
+    def renew(self, approval_id: str, claim_token: str,
+              lease_seconds: int | None = None) -> bool: ...
+    def complete(self, approval_id: str, claim_token: str) -> dict: ...
+    def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict: ...
     def reclaim_expired_claims(self) -> int: ...
     def list_items(self) -> list[dict]: ...
 
@@ -80,7 +110,9 @@ class InMemoryApprovalRepository(ApprovalRepository):
         aid = f"apr-{next(self._seq)}"
         with self._lock:
             self._items[aid] = {"id": aid, "user": user or {}, "tool": tool,
-                                "args": args or {}, "status": "pending"}
+                                "args": args or {}, "status": "pending",
+                                "consumed": False, "claim_token": None,
+                                "last_error": None}
         return aid
 
     def get(self, approval_id: str) -> dict:
@@ -105,23 +137,28 @@ class InMemoryApprovalRepository(ApprovalRepository):
     def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict:
         """原子认领：approved + 未消费 → in_progress；并发下只有 1 个赢家。"""
         lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+        token = str(uuid.uuid4())
         with self._lock:
             item = self._items[approval_id]
             if item["status"] != "approved" or item.get("consumed"):
                 raise ApprovalConflict(
                     f"approval {approval_id} is {item['status']}, not claimable")
             item["status"] = "in_progress"
+            item["claim_token"] = token
             item["claimed_at"] = time.monotonic()
             item["lease_until"] = item["claimed_at"] + lease
-            return item
+            return dict(item)
 
-    def renew(self, approval_id: str, lease_seconds: int | None = None) -> bool:
-        """心跳续期：仅当行仍由本次 claim 持有（in_progress 且未过期）时生效。"""
+    def renew(self, approval_id: str, claim_token: str,
+              lease_seconds: int | None = None) -> bool:
+        """心跳续期：仅当行仍由同一 claim_token 持有且未过期时生效。"""
         lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
         now = time.monotonic()
         with self._lock:
             item = self._items.get(approval_id)
             if item is None or item["status"] != "in_progress":
+                return False
+            if item.get("claim_token") != claim_token:
                 return False
             until = item.get("lease_until")
             if until is None or until <= now:
@@ -129,26 +166,26 @@ class InMemoryApprovalRepository(ApprovalRepository):
             item["lease_until"] = now + lease
             return True
 
-    def complete(self, approval_id: str) -> dict:
+    def complete(self, approval_id: str, claim_token: str) -> dict:
         with self._lock:
             item = self._items[approval_id]
-            if item["status"] != "in_progress":
+            if item["status"] != "in_progress" or item.get("claim_token") != claim_token:
                 raise ValueError(
-                    f"approval {approval_id} is {item['status']}, not in_progress")
+                    f"approval {approval_id} is {item['status']}, not held by this claim")
             item["status"] = "done"
             item["consumed"] = True
             item["consumed_at"] = time.monotonic()
-            return item
+            return dict(item)
 
-    def fail(self, approval_id: str, last_error: str) -> dict:
+    def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict:
         with self._lock:
             item = self._items[approval_id]
-            if item["status"] != "in_progress":
+            if item["status"] != "in_progress" or item.get("claim_token") != claim_token:
                 raise ValueError(
-                    f"approval {approval_id} is {item['status']}, not in_progress")
+                    f"approval {approval_id} is {item['status']}, not held by this claim")
             item["status"] = "failed"
             item["last_error"] = (last_error or "")[:200]
-            return item
+            return dict(item)
 
     def reclaim_expired_claims(self) -> int:
         """租约过期的 in_progress 退回 approved；返回回收条数。"""
@@ -162,7 +199,11 @@ class InMemoryApprovalRepository(ApprovalRepository):
                     item["status"] = "approved"
                     item["claimed_at"] = None
                     item["lease_until"] = None
+                    item["claim_token"] = None
                     reclaimed += 1
+        if reclaimed:
+            from observability import metrics as _metrics
+            _metrics.inc_approval_reclaimed(reclaimed)
         return reclaimed
 
     def list_items(self) -> list[dict]:
@@ -196,6 +237,7 @@ class PostgresApprovalRepository(ApprovalRepository):
             "approver": row.get("approver"),
             "consumed": bool(row.get("consumed")),
             "last_error": row.get("last_error"),
+            "claim_token": str(row["claim_token"]) if row.get("claim_token") else None,
         }
 
     def create(self, user: dict, tool: str, args: dict) -> str:
@@ -212,7 +254,8 @@ class PostgresApprovalRepository(ApprovalRepository):
 
     def get(self, approval_id: str) -> dict:
         row = self._c.fetch_one(
-            "SELECT id, user_json, tool, args, status, approver, consumed, last_error "
+            "SELECT id, user_json, tool, args, status, approver, consumed, last_error, "
+            "claim_token "
             "FROM agent_approval WHERE id = ?", (approval_id,))
         if not row:
             raise KeyError(approval_id)
@@ -237,12 +280,14 @@ class PostgresApprovalRepository(ApprovalRepository):
     def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict:
         """原子认领：approved + 未消费 → in_progress；0 行 = 已被他人认领或不可执行。"""
         lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+        token = str(uuid.uuid4())
         updated = self._c.execute_rowcount(
-            "UPDATE agent_approval SET status = 'in_progress', claimed_at = now(), "
+            "UPDATE agent_approval SET status = 'in_progress', claim_token = ?, "
+            "claimed_at = now(), "
             "lease_until = now() + (CAST(? AS INTEGER) * INTERVAL '1 second'), "
             "updated_at = now() "
             "WHERE id = ? AND status = 'approved' AND consumed = FALSE",
-            (lease, approval_id),
+            (token, lease, approval_id),
         )
         if updated:
             return self.get(approval_id)
@@ -250,55 +295,65 @@ class PostgresApprovalRepository(ApprovalRepository):
         raise ApprovalConflict(
             f"approval {approval_id} is {item['status']}, not claimable")
 
-    def renew(self, approval_id: str, lease_seconds: int | None = None) -> bool:
-        """心跳续期：条件更新，0 行 = 租约已被回收/已过期，调用方必须停止续期。"""
+    def renew(self, approval_id: str, claim_token: str,
+              lease_seconds: int | None = None) -> bool:
+        """心跳续期：条件更新，0 行 = 租约已被回收/已过期/已换主，必须停止续期。"""
         lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
         updated = self._c.execute_rowcount(
             "UPDATE agent_approval "
             "SET lease_until = now() + (CAST(? AS INTEGER) * INTERVAL '1 second'), "
             "updated_at = now() "
-            "WHERE id = ? AND status = 'in_progress' "
+            "WHERE id = ? AND status = 'in_progress' AND claim_token = ? "
             "AND lease_until IS NOT NULL AND lease_until > now()",
-            (lease, approval_id),
+            (lease, approval_id, claim_token),
         )
         return bool(updated)
 
-    def complete(self, approval_id: str) -> dict:
+    def complete(self, approval_id: str, claim_token: str) -> dict:
         updated = self._c.execute_rowcount(
             "UPDATE agent_approval SET consumed = TRUE, consumed_at = now(), "
             "status = 'done', updated_at = now() "
-            "WHERE id = ? AND status = 'in_progress' AND consumed = FALSE",
-            (approval_id,),
+            "WHERE id = ? AND status = 'in_progress' AND consumed = FALSE "
+            "AND claim_token = ?",
+            (approval_id, claim_token),
         )
         if updated:
             return self.get(approval_id)
         item = self.get(approval_id)
-        raise ValueError(f"approval {approval_id} is {item['status']}, not in_progress")
+        raise ValueError(
+            f"approval {approval_id} is {item['status']}, not held by this claim")
 
-    def fail(self, approval_id: str, last_error: str) -> dict:
+    def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict:
         summary = (last_error or "")[:200]
         updated = self._c.execute_rowcount(
             "UPDATE agent_approval SET status = 'failed', last_error = ?, "
-            "updated_at = now() WHERE id = ? AND status = 'in_progress'",
-            (summary, approval_id),
+            "updated_at = now() WHERE id = ? AND status = 'in_progress' "
+            "AND claim_token = ?",
+            (summary, approval_id, claim_token),
         )
         if updated:
             return self.get(approval_id)
         item = self.get(approval_id)
-        raise ValueError(f"approval {approval_id} is {item['status']}, not in_progress")
+        raise ValueError(
+            f"approval {approval_id} is {item['status']}, not held by this claim")
 
     def reclaim_expired_claims(self) -> int:
         """租约过期的 in_progress 退回 approved；返回回收条数（供观测）。"""
-        return self._c.execute_rowcount(
+        reclaimed = self._c.execute_rowcount(
             "UPDATE agent_approval SET status = 'approved', claimed_at = NULL, "
-            "lease_until = NULL, updated_at = now() "
+            "lease_until = NULL, claim_token = NULL, updated_at = now() "
             "WHERE status = 'in_progress' AND lease_until IS NOT NULL "
             "AND lease_until < now()"
         )
+        if reclaimed:
+            from observability import metrics as _metrics
+            _metrics.inc_approval_reclaimed(reclaimed)
+        return reclaimed
 
     def list_items(self) -> list[dict]:
         rows = self._c.fetch_all(
-            "SELECT id, user_json, tool, args, status, approver, consumed, last_error "
+            "SELECT id, user_json, tool, args, status, approver, consumed, last_error, "
+            "claim_token "
             "FROM agent_approval ORDER BY created_at")
         return [self._row(r) for r in rows]
 
@@ -327,14 +382,15 @@ class ApprovalStore:
     def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict:
         return self._repo.claim(approval_id, lease_seconds)
 
-    def renew(self, approval_id: str, lease_seconds: int | None = None) -> bool:
-        return self._repo.renew(approval_id, lease_seconds)
+    def renew(self, approval_id: str, claim_token: str,
+              lease_seconds: int | None = None) -> bool:
+        return self._repo.renew(approval_id, claim_token, lease_seconds)
 
-    def complete(self, approval_id: str) -> dict:
-        return self._repo.complete(approval_id)
+    def complete(self, approval_id: str, claim_token: str) -> dict:
+        return self._repo.complete(approval_id, claim_token)
 
-    def fail(self, approval_id: str, last_error: str) -> dict:
-        return self._repo.fail(approval_id, last_error)
+    def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict:
+        return self._repo.fail(approval_id, claim_token, last_error)
 
     def reclaim_expired_claims(self) -> int:
         return self._repo.reclaim_expired_claims()
@@ -346,16 +402,18 @@ class ApprovalStore:
 class LeaseHeartbeat:
     """执行期租约心跳：每隔 ``lease/3`` 续一次，租约不再需要大于工具时长。
 
-    续期条件更新带 ``status='in_progress' AND lease_until > now()``，所以被他人
-    回收的行不会被续命；0 行受影响即判定租约丢失（``lost=True``），由调用方决定
-    如何处置。数据库瞬时不可用只记 warning 并计数，超过阈值同样判定丢失。
+    续期条件更新同时带 ``claim_token``、``status='in_progress'`` 与
+    ``lease_until > now()``，所以被他人回收/重新认领的行不会被续命；0 行受影响
+    即判定租约丢失（``lost=True``），由调用方决定如何处置。数据库瞬时不可用只记
+    warning 并计数，超过阈值同样判定丢失。
     """
 
-    def __init__(self, store, approval_id: str, lease_seconds: int,
+    def __init__(self, store, approval_id: str, claim_token: str, lease_seconds: int,
                  interval: float | None = None,
                  max_failures: int = DEFAULT_HEARTBEAT_MAX_FAILURES):
         self._store = store
         self._id = approval_id
+        self._token = claim_token
         self._lease = max(1, int(lease_seconds))
         self.interval = (heartbeat_interval_seconds(self._lease)
                          if interval is None else max(0.01, float(interval)))
@@ -380,15 +438,19 @@ class LeaseHeartbeat:
         self._thread = None
 
     def _run(self) -> None:
+        from observability import metrics as _metrics
+
         while not self._stop.wait(self.interval):
             try:
-                renewed = self._store.renew(self._id, self._lease)
+                renewed = self._store.renew(self._id, self._token, self._lease)
             except Exception as e:  # noqa: BLE001 - 瞬时故障不断执行，只计数
                 self.failures += 1
+                _metrics.inc_approval_heartbeat_failed()
                 logger.warning("approval heartbeat renew failed (%d/%d): %s",
                                self.failures, self.max_failures, e)
                 if self.failures >= self.max_failures:
                     self.lost = True
+                    _metrics.inc_approval_lease_lost()
                     logger.warning("approval %s lease lost after %d renew failures",
                                    self._id, self.failures)
                     return
@@ -396,18 +458,19 @@ class LeaseHeartbeat:
             self.failures = 0
             if not renewed:
                 self.lost = True
+                _metrics.inc_approval_lease_lost()
                 logger.warning("approval %s lease was reclaimed; heartbeat stopped",
                                self._id)
                 return
 
 
-def start_lease_heartbeat(store, approval_id: str,
+def start_lease_heartbeat(store, approval_id: str, claim_token: str,
                           lease_seconds: int | None = None) -> LeaseHeartbeat | None:
     """claim 成功后启动心跳；配置关闭时返回 None（演练「心跳缺席」可复现）。"""
     if not approval_heartbeat_enabled():
         return None
     lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
-    return LeaseHeartbeat(store, approval_id, lease).start()
+    return LeaseHeartbeat(store, approval_id, claim_token, lease).start()
 
 
 def build_approval_store(dsn: str | None = None, connector=None) -> ApprovalStore:
