@@ -51,10 +51,16 @@ SCHEMA_DDL: list[str] = [
         approver TEXT,
         consumed BOOLEAN NOT NULL DEFAULT FALSE,
         consumed_at TIMESTAMPTZ,
+        claimed_at TIMESTAMPTZ,
+        lease_until TIMESTAMPTZ,
+        last_error TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
     """ALTER TABLE agent_approval ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ""",
+    """ALTER TABLE agent_approval ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ""",
+    """ALTER TABLE agent_approval ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ""",
+    """ALTER TABLE agent_approval ADD COLUMN IF NOT EXISTS last_error TEXT""",
     """CREATE INDEX IF NOT EXISTS idx_agent_approval_tenant ON agent_approval(tenant_id, status)""",
     """CREATE TABLE IF NOT EXISTS agent_paused_task (
         tenant_id TEXT NOT NULL,

@@ -44,8 +44,9 @@ def guarded_executor(plan: dict, state, registry=None, user=None,
                      policy=None, approvals=None, approved_approval_id=None) -> dict:
     """带Policy+HITL的执行器：deny/need_approval都不直调工具。
 
-    approved_approval_id 只在恢复路径使用：当审批单已批准，且 tool+args
-    与待执行动作完全一致时，放行这一次调用；否则仍按 need_approval 挂起。
+    approved_approval_id 只在恢复路径使用：当审批单已批准（或已被本请求原子
+    claim 成 in_progress），且 tool+args 与待执行动作完全一致时，放行这一次
+    调用；否则仍按 need_approval 挂起。
     """
     tool = plan.get("tool", "")
     args = plan.get("args", {}) or {}
@@ -59,7 +60,7 @@ def guarded_executor(plan: dict, state, registry=None, user=None,
                     item = approvals.get(approved_approval_id)
                 except KeyError:
                     item = None
-                if (item and item.get("status") == "approved"
+                if (item and item.get("status") in ("approved", "in_progress")
                         and not item.get("consumed")
                         and item.get("tool") == tool
                         and item.get("args") == args):

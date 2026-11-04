@@ -73,8 +73,8 @@ def test_tool_error_observation_carries_no_exception_text():
     _assert_no_exception_leak(result["result"])
 
 
-def test_resume_execution_result_hides_tool_exception(monkeypatch):
-    """Resume executes the approved tool; its exception must not reach the caller (#2)."""
+def test_resume_tool_failure_marks_approval_failed_without_leak(monkeypatch):
+    """Approved tool failure → approval failed with a sanitized summary, 502, no replay."""
     import apps.api.main as main
     import agent.tools.executor as executor_mod
     from infrastructure.pg import connector as conn_mod
@@ -107,6 +107,16 @@ def test_resume_execution_result_hides_tool_exception(monkeypatch):
                                 "tenant_id": "t1"})
     assert decided.status_code == 200
     resumed = client.post(f"/chat/{body['task_id']}/resume", json={"tenant_id": "t1"})
-    assert resumed.status_code == 200
-    assert resumed.json()["execution_result"] == "tool error scm.purchase.create"
+    assert resumed.status_code == 502
+    assert resumed.json()["detail"] == "approved action failed to execute"
     _assert_no_exception_leak(resumed.text)
+
+    # 两阶段：失败落在 failed，只保留脱敏摘要（工具名），不再可 resume。
+    item = main._APPROVALS.get(body["approval_id"])
+    assert item["status"] == "failed"
+    assert item["last_error"] == "tool error scm.purchase.create"
+    assert "leak-marker" not in item["last_error"]
+    assert "RuntimeError" not in item["last_error"]
+
+    again = client.post(f"/chat/{body['task_id']}/resume", json={"tenant_id": "t1"})
+    assert again.status_code == 409

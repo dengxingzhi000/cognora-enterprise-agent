@@ -12,6 +12,7 @@ drill is deterministic and observable from outside the process:
 Env:
   AGENT_DRILL_COUNTER  append-only file, one ``invoked``/``finished`` line per call
   AGENT_DRILL_SLEEP    seconds the drilled tool sleeps before finishing
+  AGENT_DRILL_FAIL     ``1`` makes the tool raise after ``invoked`` (failure path)
 """
 import os
 import time
@@ -25,6 +26,7 @@ TOOL = "payment.execute"  # HIGH_RISK in security/policy.py → requires approva
 
 COUNTER = os.environ.get("AGENT_DRILL_COUNTER", "")
 SLEEP = float(os.environ.get("AGENT_DRILL_SLEEP", "0") or 0)
+FAIL = os.environ.get("AGENT_DRILL_FAIL", "").strip().lower() in ("1", "true", "yes")
 
 
 def _record(kind: str) -> None:
@@ -36,6 +38,9 @@ def _record(kind: str) -> None:
 def _drill_tool(args: dict):
     _record("invoked")
     time.sleep(float(args.get("sleep", SLEEP) or 0))
+    if FAIL:
+        # registry_executor 会把异常转成 "tool error <tool>"，异常全文只进日志。
+        raise RuntimeError("drill-tool boom at /abs/secret/path")
     _record("finished")
     return "drill tool done"
 

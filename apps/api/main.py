@@ -1,4 +1,5 @@
 """Stage 1b Gateway - /chat routes into Agent Runtime."""
+import logging
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Response
@@ -14,9 +15,15 @@ from observability.tracing import Tracer
 from observability import metrics as _metrics
 from observability.otel import build_otel_adapter
 from integrations.scm.client import scm_trace_id
-from security.approval import ApprovalConflict, build_approval_store
+from security.approval import (
+    ApprovalConflict,
+    build_approval_store,
+    reclaim_on_resume_enabled,
+)
 from security.policy import PolicyEngine
 from agent.runtime.paused_tasks import build_paused_task_store
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Enterprise Agent Gateway", version="0.5.1")
 
@@ -71,6 +78,14 @@ def _startup():
     except Exception as e:  # noqa: BLE001 - 可观测性不能阻断启动
         import warnings
         warnings.warn(f"OTel adapter init failed: {e}")
+
+
+def _mark_approval_failed(approval_id: str, summary: str) -> None:
+    """工具/执行失败时把审批置为 failed；摘要已脱敏，异常全文只进日志。"""
+    try:
+        _APPROVALS.fail(approval_id, summary)
+    except Exception:  # noqa: BLE001 - 标记失败不能掩盖原始错误
+        logger.exception("failed to mark approval %s as failed", approval_id)
 
 
 def _chat_payload(final: AgentState | None, user_id: str, trace_id: str) -> dict:
@@ -172,6 +187,15 @@ def decide_approval(approval_id: str, req: ApprovalDecision):
 def resume_chat(task_id: str, req: ResumeRequest | None = None):
     """从 paused 恢复：审批通过则执行被挂起的动作，驳回则取消任务。"""
     tenant = req.tenant_id if req else "t1"
+    # 惰性回收：resume 是审批单的唯一消费方，无需额外后台任务；一次条件 UPDATE
+    # 把租约过期的 in_progress 退回 approved（崩溃后最多重放一次的前提）。
+    if reclaim_on_resume_enabled():
+        try:
+            reclaimed = _APPROVALS.reclaim_expired_claims()
+            if reclaimed:
+                logger.warning("reclaimed %d expired approval claim(s)", reclaimed)
+        except Exception:  # noqa: BLE001 - 回收失败不阻断本次 resume
+            logger.exception("approval lease reclaim failed")
     state = _PAUSED_TASKS.get(tenant, task_id)
     if state is None:
         raise HTTPException(status_code=404, detail="task not found or already completed")
@@ -217,18 +241,39 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
     if item["status"] != "approved":
         raise HTTPException(status_code=409, detail=f"approval is {item['status']}, not approved")
 
+    # 两阶段第一步：原子 claim。并发 resume 只有一个进入执行，其余拿到 409；
+    # 进程崩溃后行停在 in_progress，租约到期才允许重试（最多重放一次）。
+    try:
+        _APPROVALS.claim(aid)
+    except ApprovalConflict:
+        raise HTTPException(status_code=409, detail="approval is already claimed")
+
     tool = item["tool"]
     args = item["args"]
-    obs = guarded_executor(
-        {"action": "call_tool", "tool": tool, "args": args},
-        state, user=user, policy=PolicyEngine(),
-        approvals=_APPROVALS, approved_approval_id=aid,
-    )
+    try:
+        obs = guarded_executor(
+            {"action": "call_tool", "tool": tool, "args": args},
+            state, user=user, policy=PolicyEngine(),
+            approvals=_APPROVALS, approved_approval_id=aid,
+        )
+    except Exception:  # noqa: BLE001 - 执行异常只进日志，不向调用方回显
+        logger.exception("approved action failed")
+        _mark_approval_failed(aid, "execution failed")
+        raise HTTPException(status_code=502, detail="approved action failed to execute")
+
     # 若放行失败，guarded_executor 会写入一个新的 approval_id；此时不动原审批单。
     if state.context.get("approval_id") != aid:
+        _mark_approval_failed(aid, "approval does not match pending action")
         raise HTTPException(status_code=409, detail="approval does not match pending action")
 
-    _APPROVALS.consume(aid)
+    result = str(obs.get("result", ""))
+    if result.startswith("tool error ") or result.startswith("unknown tool:"):
+        # 工具失败的 Observation 已只含工具名（无异常文本/栈），直接作为脱敏摘要。
+        _mark_approval_failed(aid, result)
+        raise HTTPException(status_code=502, detail="approved action failed to execute")
+
+    # 两阶段第二步：成功才置 done + consumed。
+    _APPROVALS.complete(aid)
     state.observations.append(obs)
     state.messages.append({"role": "observation", "content": str(obs)})
     for key in ("pause_reason", "approval_id", "approval_tool", "approval_args"):

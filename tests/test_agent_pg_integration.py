@@ -59,10 +59,13 @@ def test_approval_postgres_roundtrip(connector):
         assert approved["status"] == "approved"
         assert approved["approver"] == "mgr-1"
 
-        consumed = store.consume(aid)
-        assert consumed["consumed"] is True
+        claimed = store.claim(aid)
+        assert claimed["status"] == "in_progress"
+
+        completed = store.complete(aid)
+        assert completed["consumed"] is True
         with pytest.raises(ValueError):
-            store.consume(aid)
+            store.complete(aid)
 
         listed = [i for i in store.list_items() if i["id"] == aid]
         assert len(listed) == 1

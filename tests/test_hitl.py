@@ -240,13 +240,14 @@ def test_guarded_executor_ignores_approved_id_for_other_args():
     assert len(store._items) == 2
 
 
-def test_approval_consume_blocks_replay():
+def test_approval_claim_blocks_replay():
     from security.approval import ApprovalStore
 
     user = {"tenant_id": "t1", "role": "admin", "user_id": "u1"}
     store = ApprovalStore()
     aid = store.request(user, "scm.purchase.create", {"sku": "X"})
     store.approve(aid, "mgr-1")
-    assert store.consume(aid)["consumed"] is True
+    assert store.claim(aid)["status"] == "in_progress"
+    assert store.complete(aid)["consumed"] is True
     with pytest.raises(ValueError):
-        store.consume(aid)
+        store.claim(aid)

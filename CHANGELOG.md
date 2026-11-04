@@ -8,6 +8,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [0.5.5] — 2026-11-04
+
+Two-phase resume: **claim → execute → done/failed**, with a lease and lazy
+reclaim. This removes the duplicate side effect that v0.5.4's drill quantified
+(concurrent resume) and bounds post-crash replay to at most one.
+
+### Changed
+
+- `agent_approval.status` gains `in_progress` and `failed`. There was **no
+  CHECK constraint** on the column, so the migration is additive only:
+  `claimed_at`, `lease_until`, `last_error` are added inline and via
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in both `scripts/db/agent_schema.sql`
+  and `ensure_schema`.
+- `POST /chat/{task_id}/resume` now:
+  1. lazily calls `reclaim_expired_claims()` (configurable),
+  2. atomically `claim`s the approval (`approved` + `consumed=FALSE` →
+     `in_progress` + lease); 0 rows → `ApprovalConflict` → **409**,
+  3. executes the tool,
+  4. on success sets `status='done'`, `consumed=TRUE`, `consumed_at=now()`,
+  5. on tool/execution failure sets `status='failed'` and a **sanitized**
+     `last_error` (tool name only; the exception text/stack stays in logs) and
+     returns **502**; `failed` is terminal for resume.
+- `ApprovalRepository` replaces `consume()` with `claim()` / `complete()` /
+  `fail()` / `reclaim_expired_claims()`. `guarded_executor` accepts
+  `in_progress` for the id it just claimed.
+
+### Lease semantics
+
+- `AGENT_APPROVAL_LEASE_SECONDS` (default `300`) — how long the claiming
+  request owns the approval.
+- `AGENT_APPROVAL_RECLAIM_ON_RESUME` (default `true`) — reclaim expired
+  `in_progress` rows at the resume entry point, so no scheduler is required.
+  A reclaim returns the row to `approved`, making one retry possible.
+
+### Testing (real Postgres + real uvicorn, no skips in CI)
+
+- Two concurrent resumes on one approval → exactly one **200**, one **409**,
+  counter `invoked=1`.
+- Kill mid-tool → row is `in_progress` with a live lease → retry **409**; after
+  the lease expires (fast-forwarded in the drill) the reclaim allows exactly
+  **one replay** (`invoked=2`, `finished=1`).
+- Tool raises → `status='failed'`, `last_error` contains no `Traceback`,
+  exception class or absolute path, and resume is rejected (**409**).
+- Regressions: approve + resume → `done`/`consumed`, second resume **404**;
+  kill while `WAITING_APPROVAL`; paused-task concurrent upsert stays one row.
+- The existing gate still fails the job if any of these skip.
+
+### Not covered
+
+- VM real-environment drills and multi-instance / multi-process ownership are
+  **still not exercised**; the drills run on a runner-local Postgres.
+- Tool-level idempotency is not implemented: a crash mid-tool still permits one
+  replay after the lease expires. The lease prevents concurrent double
+  execution and immediate retries; it cannot undo a partially executed side
+  effect.
+- `/chat` still has no idempotency key.
+
 ## [0.5.4] — 2026-11-04
 
 Kill/restart drills are now automated in CI against a real uvicorn process and
