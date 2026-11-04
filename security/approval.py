@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 import time
 import uuid
@@ -38,6 +39,14 @@ def reclaim_on_resume_enabled() -> bool:
     """resume 入口是否惰性回收过期租约（默认开）。"""
     raw = os.environ.get("AGENT_APPROVAL_RECLAIM_ON_RESUME", "true")
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def instance_id() -> str:
+    """本实例标识：``AGENT_INSTANCE_ID`` 优先，否则 ``hostname:pid``。"""
+    raw = os.environ.get("AGENT_INSTANCE_ID")
+    if raw and raw.strip():
+        return raw.strip()
+    return f"{socket.gethostname()}:{os.getpid()}"
 
 
 def approval_heartbeat_enabled() -> bool:
@@ -91,12 +100,15 @@ class ApprovalRepository:
     def get(self, approval_id: str) -> dict: ...
     def approve(self, approval_id: str, approver: str) -> dict: ...
     def reject(self, approval_id: str, approver: str) -> dict: ...
-    def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict: ...
+    def claim(self, approval_id: str, lease_seconds: int | None = None,
+              claimed_by: str | None = None) -> dict: ...
     def renew(self, approval_id: str, claim_token: str,
-              lease_seconds: int | None = None) -> bool: ...
+              lease_seconds: int | None = None,
+              claimed_by: str | None = None) -> bool: ...
     def complete(self, approval_id: str, claim_token: str) -> dict: ...
     def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict: ...
-    def reclaim_expired_claims(self) -> int: ...
+    def release(self, approval_id: str, claim_token: str) -> bool: ...
+    def reclaim_expired_claims(self, claimed_by: str | None = None) -> int: ...
     def list_items(self) -> list[dict]: ...
 
 
@@ -112,7 +124,7 @@ class InMemoryApprovalRepository(ApprovalRepository):
             self._items[aid] = {"id": aid, "user": user or {}, "tool": tool,
                                 "args": args or {}, "status": "pending",
                                 "consumed": False, "claim_token": None,
-                                "last_error": None}
+                                "claimed_by": None, "last_error": None}
         return aid
 
     def get(self, approval_id: str) -> dict:
@@ -134,10 +146,12 @@ class InMemoryApprovalRepository(ApprovalRepository):
     def reject(self, approval_id: str, approver: str) -> dict:
         return self._set_status(approval_id, "rejected", approver)
 
-    def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict:
+    def claim(self, approval_id: str, lease_seconds: int | None = None,
+              claimed_by: str | None = None) -> dict:
         """原子认领：approved + 未消费 → in_progress；并发下只有 1 个赢家。"""
         lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
         token = str(uuid.uuid4())
+        owner = claimed_by or instance_id()
         with self._lock:
             item = self._items[approval_id]
             if item["status"] != "approved" or item.get("consumed"):
@@ -145,20 +159,25 @@ class InMemoryApprovalRepository(ApprovalRepository):
                     f"approval {approval_id} is {item['status']}, not claimable")
             item["status"] = "in_progress"
             item["claim_token"] = token
+            item["claimed_by"] = owner
             item["claimed_at"] = time.monotonic()
             item["lease_until"] = item["claimed_at"] + lease
             return dict(item)
 
     def renew(self, approval_id: str, claim_token: str,
-              lease_seconds: int | None = None) -> bool:
-        """心跳续期：仅当行仍由同一 claim_token 持有且未过期时生效。"""
+              lease_seconds: int | None = None,
+              claimed_by: str | None = None) -> bool:
+        """心跳续期：仅当行仍由同一 claim_token/实例持有且未过期时生效。"""
         lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+        owner = claimed_by or instance_id()
         now = time.monotonic()
         with self._lock:
             item = self._items.get(approval_id)
             if item is None or item["status"] != "in_progress":
                 return False
             if item.get("claim_token") != claim_token:
+                return False
+            if item.get("claimed_by") != owner:
                 return False
             until = item.get("lease_until")
             if until is None or until <= now:
@@ -187,19 +206,37 @@ class InMemoryApprovalRepository(ApprovalRepository):
             item["last_error"] = (last_error or "")[:200]
             return dict(item)
 
-    def reclaim_expired_claims(self) -> int:
+    def release(self, approval_id: str, claim_token: str) -> bool:
+        """把刚 claim 的行退回 approved（尚未执行任何副作用时使用）。"""
+        with self._lock:
+            item = self._items.get(approval_id)
+            if (item is None or item["status"] != "in_progress"
+                    or item.get("claim_token") != claim_token):
+                return False
+            item["status"] = "approved"
+            item["claimed_at"] = None
+            item["lease_until"] = None
+            item["claim_token"] = None
+            item["claimed_by"] = None
+            return True
+
+    def reclaim_expired_claims(self, claimed_by: str | None = None) -> int:
         """租约过期的 in_progress 退回 approved；返回回收条数。"""
         now = time.monotonic()
+        owner = claimed_by or instance_id()
         reclaimed = 0
         with self._lock:
             for item in self._items.values():
                 if (item["status"] == "in_progress"
                         and item.get("lease_until") is not None
-                        and item["lease_until"] < now):
+                        and item["lease_until"] < now
+                        and not (item.get("claimed_by") == owner
+                                 and item["lease_until"] > now)):
                     item["status"] = "approved"
                     item["claimed_at"] = None
                     item["lease_until"] = None
                     item["claim_token"] = None
+                    item["claimed_by"] = None
                     reclaimed += 1
         if reclaimed:
             from observability import metrics as _metrics
@@ -238,6 +275,7 @@ class PostgresApprovalRepository(ApprovalRepository):
             "consumed": bool(row.get("consumed")),
             "last_error": row.get("last_error"),
             "claim_token": str(row["claim_token"]) if row.get("claim_token") else None,
+            "claimed_by": row.get("claimed_by"),
         }
 
     def create(self, user: dict, tool: str, args: dict) -> str:
@@ -255,7 +293,7 @@ class PostgresApprovalRepository(ApprovalRepository):
     def get(self, approval_id: str) -> dict:
         row = self._c.fetch_one(
             "SELECT id, user_json, tool, args, status, approver, consumed, last_error, "
-            "claim_token "
+            "claim_token, claimed_by "
             "FROM agent_approval WHERE id = ?", (approval_id,))
         if not row:
             raise KeyError(approval_id)
@@ -277,17 +315,19 @@ class PostgresApprovalRepository(ApprovalRepository):
     def reject(self, approval_id: str, approver: str) -> dict:
         return self._set_status(approval_id, "rejected", approver)
 
-    def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict:
+    def claim(self, approval_id: str, lease_seconds: int | None = None,
+              claimed_by: str | None = None) -> dict:
         """原子认领：approved + 未消费 → in_progress；0 行 = 已被他人认领或不可执行。"""
         lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+        owner = claimed_by or instance_id()
         token = str(uuid.uuid4())
         updated = self._c.execute_rowcount(
             "UPDATE agent_approval SET status = 'in_progress', claim_token = ?, "
-            "claimed_at = now(), "
+            "claimed_by = ?, claimed_at = now(), "
             "lease_until = now() + (CAST(? AS INTEGER) * INTERVAL '1 second'), "
             "updated_at = now() "
             "WHERE id = ? AND status = 'approved' AND consumed = FALSE",
-            (token, lease, approval_id),
+            (token, owner, lease, approval_id),
         )
         if updated:
             return self.get(approval_id)
@@ -296,16 +336,19 @@ class PostgresApprovalRepository(ApprovalRepository):
             f"approval {approval_id} is {item['status']}, not claimable")
 
     def renew(self, approval_id: str, claim_token: str,
-              lease_seconds: int | None = None) -> bool:
+              lease_seconds: int | None = None,
+              claimed_by: str | None = None) -> bool:
         """心跳续期：条件更新，0 行 = 租约已被回收/已过期/已换主，必须停止续期。"""
         lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+        owner = claimed_by or instance_id()
         updated = self._c.execute_rowcount(
             "UPDATE agent_approval "
             "SET lease_until = now() + (CAST(? AS INTEGER) * INTERVAL '1 second'), "
             "updated_at = now() "
             "WHERE id = ? AND status = 'in_progress' AND claim_token = ? "
+            "AND claimed_by = ? "
             "AND lease_until IS NOT NULL AND lease_until > now()",
-            (lease, approval_id, claim_token),
+            (lease, approval_id, claim_token, owner),
         )
         return bool(updated)
 
@@ -337,13 +380,29 @@ class PostgresApprovalRepository(ApprovalRepository):
         raise ValueError(
             f"approval {approval_id} is {item['status']}, not held by this claim")
 
-    def reclaim_expired_claims(self) -> int:
-        """租约过期的 in_progress 退回 approved；返回回收条数（供观测）。"""
+    def release(self, approval_id: str, claim_token: str) -> bool:
+        """把刚 claim 的行退回 approved（尚未执行任何副作用时使用）。"""
+        updated = self._c.execute_rowcount(
+            "UPDATE agent_approval SET status = 'approved', claimed_at = NULL, "
+            "lease_until = NULL, claim_token = NULL, claimed_by = NULL, updated_at = now() "
+            "WHERE id = ? AND status = 'in_progress' AND claim_token = ?",
+            (approval_id, claim_token),
+        )
+        return bool(updated)
+
+    def reclaim_expired_claims(self, claimed_by: str | None = None) -> int:
+        """租约过期的 in_progress 退回 approved；返回回收条数（供观测）。
+
+        显式排除「本实例持有且租约仍在有效期内」的行，避免自己回收自己。
+        """
+        owner = claimed_by or instance_id()
         reclaimed = self._c.execute_rowcount(
             "UPDATE agent_approval SET status = 'approved', claimed_at = NULL, "
-            "lease_until = NULL, claim_token = NULL, updated_at = now() "
+            "lease_until = NULL, claim_token = NULL, claimed_by = NULL, updated_at = now() "
             "WHERE status = 'in_progress' AND lease_until IS NOT NULL "
-            "AND lease_until < now()"
+            "AND lease_until < now() "
+            "AND NOT (claimed_by = ? AND lease_until > now())",
+            (owner,),
         )
         if reclaimed:
             from observability import metrics as _metrics
@@ -353,7 +412,7 @@ class PostgresApprovalRepository(ApprovalRepository):
     def list_items(self) -> list[dict]:
         rows = self._c.fetch_all(
             "SELECT id, user_json, tool, args, status, approver, consumed, last_error, "
-            "claim_token "
+            "claim_token, claimed_by "
             "FROM agent_approval ORDER BY created_at")
         return [self._row(r) for r in rows]
 
@@ -379,12 +438,14 @@ class ApprovalStore:
     def reject(self, approval_id: str, approver: str) -> dict:
         return self._repo.reject(approval_id, approver)
 
-    def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict:
-        return self._repo.claim(approval_id, lease_seconds)
+    def claim(self, approval_id: str, lease_seconds: int | None = None,
+              claimed_by: str | None = None) -> dict:
+        return self._repo.claim(approval_id, lease_seconds, claimed_by)
 
     def renew(self, approval_id: str, claim_token: str,
-              lease_seconds: int | None = None) -> bool:
-        return self._repo.renew(approval_id, claim_token, lease_seconds)
+              lease_seconds: int | None = None,
+              claimed_by: str | None = None) -> bool:
+        return self._repo.renew(approval_id, claim_token, lease_seconds, claimed_by)
 
     def complete(self, approval_id: str, claim_token: str) -> dict:
         return self._repo.complete(approval_id, claim_token)
@@ -392,8 +453,11 @@ class ApprovalStore:
     def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict:
         return self._repo.fail(approval_id, claim_token, last_error)
 
-    def reclaim_expired_claims(self) -> int:
-        return self._repo.reclaim_expired_claims()
+    def release(self, approval_id: str, claim_token: str) -> bool:
+        return self._repo.release(approval_id, claim_token)
+
+    def reclaim_expired_claims(self, claimed_by: str | None = None) -> int:
+        return self._repo.reclaim_expired_claims(claimed_by)
 
     def list_items(self) -> list[dict]:
         return self._repo.list_items()

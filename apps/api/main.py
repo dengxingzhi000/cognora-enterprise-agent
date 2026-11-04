@@ -28,6 +28,12 @@ from security.approval import (
     start_lease_heartbeat,
     validate_heartbeat_settings,
 )
+from security.tool_effect import (
+    CACHED as TOOL_EFFECT_CACHED,
+    CONFLICT as TOOL_EFFECT_CONFLICT,
+    build_tool_effect_store,
+    result_ref,
+)
 from security.policy import PolicyEngine
 from agent.runtime.paused_tasks import build_paused_task_store
 
@@ -40,6 +46,7 @@ app = FastAPI(title="Enterprise Agent Gateway", version="0.5.1")
 # 测试与本地开发不需要数据库。挂起任务按 (tenant_id, task_id) 隔离。
 _APPROVALS = build_approval_store()
 _PAUSED_TASKS = build_paused_task_store()
+_TOOL_EFFECTS = build_tool_effect_store()
 
 
 class ChatRequest(BaseModel):
@@ -262,47 +269,76 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
 
     tool = item["tool"]
     args = item["args"]
-    # 两阶段执行期：心跳每隔 lease/3 续期一次，租约因此不再需要大于工具时长。
-    heartbeat = start_lease_heartbeat(_APPROVALS, aid, token, lease)
-    timeout = tool_timeout_seconds()
-    try:
-        obs = execute_with_timeout(
-            lambda: guarded_executor(
-                {"action": "call_tool", "tool": tool, "args": args},
-                state, user=user, policy=PolicyEngine(),
-                approvals=_APPROVALS, approved_approval_id=aid,
-            ),
-            timeout,
-        )
-    except ToolTimeout:
-        # 线程无法强杀：放弃本次执行、写固定文案的终态，心跳在 finally 停止。
-        logger.warning("approved action timed out after %ss", timeout)
-        _mark_approval_failed(aid, token, "tool timeout")
-        raise HTTPException(status_code=504, detail="approved action timed out")
-    except Exception:  # noqa: BLE001 - 执行异常只进日志，不向调用方回显
-        logger.exception("approved action failed")
-        _mark_approval_failed(aid, token, "execution failed")
-        raise HTTPException(status_code=502, detail="approved action failed to execute")
-    finally:
-        # 工具返回或抛异常后必须停掉续期循环，避免线程泄漏。
-        if heartbeat is not None:
-            heartbeat.stop()
 
-    if heartbeat is not None and heartbeat.lost:
-        # 租约在执行期间被回收：不再写 done/failed，避免覆盖他人的 claim。
-        logger.warning("approval %s lease was lost during execution", aid)
-        raise HTTPException(status_code=409, detail="approval lease lost during execution")
+    # 写工具幂等：同一 approval + 工具 + 参数只真正执行一次。占位先于心跳；
+    # succeeded 直接回放引用，started 说明上一次执行仍在进行/已崩溃（绝不并跑）。
+    effect = _TOOL_EFFECTS.begin(tenant, aid, tool, args)
+    if effect["decision"] == TOOL_EFFECT_CONFLICT:
+        # 尚未执行任何副作用：把 claim 退回 approved，避免白等一个租约。
+        try:
+            _APPROVALS.release(aid, token)
+        except Exception:  # noqa: BLE001 - 释放失败不掩盖冲突本身
+            logger.exception("failed to release approval %s after effect conflict", aid)
+        raise HTTPException(status_code=409, detail="tool execution already started")
+
+    cached = effect["decision"] == TOOL_EFFECT_CACHED
+    # 两阶段执行期：心跳每隔 lease/3 续期一次，租约因此不再需要大于工具时长。
+    heartbeat = None if cached else start_lease_heartbeat(_APPROVALS, aid, token, lease)
+    if cached:
+        obs = {"tool": tool, "result": effect.get("result_ref") or "cached", "cached": True}
+    else:
+        timeout = tool_timeout_seconds()
+        try:
+            obs = execute_with_timeout(
+                lambda: guarded_executor(
+                    {"action": "call_tool", "tool": tool, "args": args},
+                    state, user=user, policy=PolicyEngine(),
+                    approvals=_APPROVALS, approved_approval_id=aid,
+                ),
+                timeout,
+            )
+        except ToolTimeout:
+            # 线程无法强杀：本次放弃，effect 标记 failed + 「可能已产生副作用」，
+            # 审批写固定文案的终态，心跳在 finally 停止。
+            logger.warning("approved action timed out after %ss", timeout)
+            _TOOL_EFFECTS.fail(tenant, aid, tool, args, maybe_side_effect=True)
+            _mark_approval_failed(aid, token, "tool timeout")
+            raise HTTPException(status_code=504, detail="approved action timed out")
+        except Exception:  # noqa: BLE001 - 执行异常只进日志，不向调用方回显
+            logger.exception("approved action failed")
+            # 异常发生在工具调用前后无法判定，保守标记「可能已产生副作用」。
+            _TOOL_EFFECTS.fail(tenant, aid, tool, args, maybe_side_effect=True)
+            _mark_approval_failed(aid, token, "execution failed")
+            raise HTTPException(status_code=502, detail="approved action failed to execute")
+        finally:
+            # 工具返回或抛异常后必须停掉续期循环，避免线程泄漏。
+            if heartbeat is not None:
+                heartbeat.stop()
+
+        if heartbeat is not None and heartbeat.lost:
+            # 租约在执行期间被回收：不再写 done/failed，避免覆盖他人的 claim。
+            logger.warning("approval %s lease was lost during execution", aid)
+            raise HTTPException(status_code=409, detail="approval lease lost during execution")
 
     # 若放行失败，guarded_executor 会写入一个新的 approval_id；此时不动原审批单。
     if state.context.get("approval_id") != aid:
+        if not cached:
+            _TOOL_EFFECTS.fail(tenant, aid, tool, args, maybe_side_effect=False)
         _mark_approval_failed(aid, token, "approval does not match pending action")
         raise HTTPException(status_code=409, detail="approval does not match pending action")
 
     result = str(obs.get("result", ""))
-    if result.startswith("tool error ") or result.startswith("unknown tool:"):
+    if not cached and (result.startswith("tool error ") or result.startswith("unknown tool:")):
         # 工具失败的 Observation 已只含工具名（无异常文本/栈），直接作为脱敏摘要。
+        # tool error 无法判定是否部分生效，保守标记可能已产生副作用；unknown tool 则没有。
+        _TOOL_EFFECTS.fail(tenant, aid, tool, args,
+                           maybe_side_effect=result.startswith("tool error "))
         _mark_approval_failed(aid, token, result)
         raise HTTPException(status_code=502, detail="approved action failed to execute")
+
+    if not cached:
+        # 只存结果摘要引用（sha256），不落工具返回明文。
+        _TOOL_EFFECTS.succeed(tenant, aid, tool, args, result_ref(result))
 
     # 两阶段第二步：成功才置 done + consumed。条件更新 0 行（含 claim_token 不匹配）
     # 说明租约已被回收/换主，此时不覆盖他人的 claim。
@@ -321,7 +357,10 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
         at.transition("running", "resume_approved")
         at.transition("done", "approval_executed")
     state.status = "done"
-    state.answer = f"approval {aid} approved by {item.get('approver', 'unknown')}; executed {tool}"
+    state.answer = (
+        f"approval {aid} approved by {item.get('approver', 'unknown')}; "
+        f"{'replayed cached result for' if cached else 'executed'} {tool}"
+    )
     _PAUSED_TASKS.delete(tenant, task_id)
 
     return {
@@ -335,6 +374,7 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
         "approval_id": aid,
         "approval_tool": tool,
         "approval_args": args,
-        "executed": True,
+        "executed": not cached,
+        "cached": cached,
         "execution_result": obs.get("result", ""),
     }

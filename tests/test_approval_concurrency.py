@@ -45,6 +45,7 @@ def _tenant() -> str:
 
 def _cleanup(connector, *, approval_id=None, tenant=None, task_id=None) -> None:
     if approval_id:
+        connector.execute("DELETE FROM agent_tool_effect WHERE approval_id = ?", (approval_id,))
         connector.execute("DELETE FROM agent_approval WHERE id = ?", (approval_id,))
     if tenant and task_id:
         connector.execute(
@@ -188,6 +189,76 @@ def test_concurrent_approve_and_reject_one_wins(store, connector):
         assert store.get(aid)["status"] == winner
     finally:
         _cleanup(connector, approval_id=aid)
+
+
+def test_reclaim_respects_instance_ownership(store, connector):
+    """claim 写入 claimed_by；本实例未过期租约不回收，他实例过期租约可回收。"""
+    tenant = _tenant()
+    own = store.request({"tenant_id": tenant, "user_id": "u1"},
+                        TOOL, {"sku": "X", "tenant_id": tenant})
+    other = store.request({"tenant_id": tenant, "user_id": "u1"},
+                          TOOL, {"sku": "Y", "tenant_id": tenant})
+    store.approve(own, "mgr-1")
+    store.approve(other, "mgr-1")
+    try:
+        claimed = store.claim(own, lease_seconds=120, claimed_by="inst-self")
+        assert claimed["claimed_by"] == "inst-self"
+        assert store.reclaim_expired_claims(claimed_by="inst-self") == 0
+        assert store.get(own)["status"] == "in_progress"
+
+        store.claim(other, lease_seconds=1, claimed_by="inst-other")
+        time.sleep(1.4)
+        assert store.reclaim_expired_claims(claimed_by="inst-self") >= 1
+        o = store.get(other)
+        assert o["status"] == "approved", o
+        assert o["claimed_by"] is None, o
+
+        # 本实例自己的过期租约仍然可回收（只保护未过期的）。
+        connector.execute(
+            "UPDATE agent_approval SET lease_until = now() - INTERVAL '1 second' "
+            "WHERE id = ?", (own,))
+        assert store.reclaim_expired_claims(claimed_by="inst-self") >= 1
+        assert store.get(own)["status"] == "approved"
+    finally:
+        _cleanup(connector, approval_id=own)
+        _cleanup(connector, approval_id=other)
+
+
+def test_tool_effect_pg_is_idempotent(connector):
+    """PG 占位：succeeded 回放不执行；failed 只允许一次重试（attempt=2）。"""
+    from security.tool_effect import (
+        CACHED, CONFLICT, EXECUTE, build_tool_effect_store,
+    )
+
+    effects = build_tool_effect_store(connector)
+    tenant = _tenant()
+    ok_id = f"apr-eff-{uuid.uuid4().hex[:10]}"
+    retry_id = f"apr-eff-{uuid.uuid4().hex[:10]}"
+    try:
+        d1 = effects.begin(tenant, ok_id, TOOL, {"sku": "A"})
+        assert d1["decision"] == EXECUTE and d1["attempt"] == 1
+        assert effects.succeed(tenant, ok_id, TOOL, {"sku": "A"}, "sha256:ref1") is True
+        d2 = effects.begin(tenant, ok_id, TOOL, {"sku": "A"})
+        assert d2["decision"] == CACHED, d2
+        assert d2["result_ref"] == "sha256:ref1"
+
+        r1 = effects.begin(tenant, retry_id, TOOL, {"sku": "B"})
+        assert r1["decision"] == EXECUTE and r1["attempt"] == 1
+        assert effects.fail(tenant, retry_id, TOOL, {"sku": "B"},
+                            maybe_side_effect=False) is True
+        r2 = effects.begin(tenant, retry_id, TOOL, {"sku": "B"})
+        assert r2["decision"] == EXECUTE and r2["attempt"] == 2, r2
+        assert effects.fail(tenant, retry_id, TOOL, {"sku": "B"},
+                            maybe_side_effect=True) is True
+        r3 = effects.begin(tenant, retry_id, TOOL, {"sku": "B"})
+        assert r3["decision"] == CONFLICT, r3
+        assert r3["reason"] == "retry budget exhausted", r3
+        row = effects.get(tenant, retry_id, TOOL, {"sku": "B"})
+        assert row["status"] == "failed" and row["attempt"] == 2, row
+        assert bool(row["maybe_side_effect"]) is True, row
+    finally:
+        _cleanup(connector, approval_id=ok_id)
+        _cleanup(connector, approval_id=retry_id)
 
 
 def test_stale_claim_token_cannot_write_terminal_state(store, connector):
