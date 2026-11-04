@@ -14,7 +14,7 @@ from observability.tracing import Tracer
 from observability import metrics as _metrics
 from observability.otel import build_otel_adapter
 from integrations.scm.client import scm_trace_id
-from security.approval import build_approval_store
+from security.approval import ApprovalConflict, build_approval_store
 from security.policy import PolicyEngine
 from agent.runtime.paused_tasks import build_paused_task_store
 
@@ -149,9 +149,15 @@ def decide_approval(approval_id: str, req: ApprovalDecision):
         raise HTTPException(status_code=409, detail=f"approval already {item['status']}")
 
     if req.decision == "approve":
-        item = _APPROVALS.approve(approval_id, req.approver)
+        try:
+            item = _APPROVALS.approve(approval_id, req.approver)
+        except ApprovalConflict:
+            raise HTTPException(status_code=409, detail="approval changed concurrently")
     else:
-        item = _APPROVALS.reject(approval_id, req.approver)
+        try:
+            item = _APPROVALS.reject(approval_id, req.approver)
+        except ApprovalConflict:
+            raise HTTPException(status_code=409, detail="approval changed concurrently")
 
     return {
         "approval_id": approval_id,

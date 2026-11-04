@@ -13,6 +13,8 @@ class OperationalError(Exception):
 class BaseConnector:
     def execute(self, sql: str, params: Sequence[Any] = ()) -> None: ...
 
+    def execute_rowcount(self, sql: str, params: Sequence[Any] = ()) -> int: ...
+
     def fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[dict]: ...
 
     def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> dict | None: ...
@@ -100,6 +102,10 @@ class InMemoryConnector(BaseConnector):
     def healthcheck(self) -> bool:
         return True
 
+    def execute_rowcount(self, sql: str, params: Sequence[Any] = ()) -> int:
+        """内存连接器不解析 UPDATE；条件更新只由 PG 仓储使用。"""
+        raise NotImplementedError("InMemoryConnector has no rowcount semantics")
+
     def ensure_schema(self) -> None:
         return None
 
@@ -153,6 +159,10 @@ class PGConnector(BaseConnector):
                     if op == "execute":
                         conn.commit()
                         return None
+                    if op == "rowcount":
+                        rowcount = result.rowcount
+                        conn.commit()
+                        return rowcount
                     rows = [dict(r._mapping) for r in result]
                     return rows if op == "fetch_all" else (rows[0] if rows else None)
             except Exception as e:  # noqa: BLE001 - retry all to keep contract
@@ -163,6 +173,10 @@ class PGConnector(BaseConnector):
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
         self._run("execute", sql, params)
+
+    def execute_rowcount(self, sql: str, params: Sequence[Any] = ()) -> int:
+        """条件 UPDATE 的影响行数；0 表示 WHERE 未命中（并发冲突）。"""
+        return int(self._run("rowcount", sql, params) or 0)
 
     def fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         return self._run("fetch_all", sql, params)

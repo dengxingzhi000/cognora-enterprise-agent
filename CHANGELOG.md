@@ -8,6 +8,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [0.5.3] — 2026-11-04
+
+Concurrency hardening for the HITL approval store, verified against a real
+Postgres in CI.
+
+### Fixed
+
+- `ApprovalRepository.consume()` is now a single conditional update
+  (`UPDATE ... SET consumed=TRUE, consumed_at=now() WHERE id=? AND consumed=FALSE
+  AND status='approved'`). The row count decides the outcome, so two concurrent
+  consumes cannot both succeed; the loser raises `ValueError("already consumed")`.
+- `approve` / `reject` use `WHERE status='pending'` and raise `ApprovalConflict`
+  when the row count is 0. `POST /approval/{id}/decide` maps that conflict to
+  **409** instead of silently overwriting the first decision.
+- `agent_approval.consumed_at` column added (idempotent `ADD COLUMN IF NOT
+  EXISTS` in `scripts/db/agent_schema.sql` and `infrastructure/pg/schema.py`).
+- In-memory implementation keeps the same semantics under a lock; no interface
+  changes.
+
+### Testing
+
+- CI now starts a one-shot `postgres:16` service (trust auth, runner-local) and
+  applies `scripts/db/agent_schema.sql`; `AGENT_TEST_PG_DSN` points the real-PG
+  cases at it. A dedicated step fails the job if
+  `tests/test_approval_concurrency.py` reports any skip.
+- New cases: 4 threads consume one approval (exactly 1 wins), concurrent
+  approve+reject (exactly 1 wins, the other gets `ApprovalConflict`), and 8
+  threads upserting one `(tenant_id, task_id)` paused task (single row).
+- Offline (`AGENT_TEST_PG_DSN` unset): the three concurrency cases skip; the
+  rest of the suite is unchanged.
+
+### Not covered
+
+- **kill/restart drills are still not executed** (no reachable Postgres on the
+  dev box or the VM at verification time), so `agent_paused_task` recovery after
+  `kill -9` and `Command(resume=...)` after a restart remain unverified.
+- Multi-instance / multi-process concurrency is not tested; only threads against
+  one Postgres.
+- `/chat/{task_id}/resume` still executes the tool *before* `consume()`, so two
+  concurrent resumes can still both reach the tool call even though only one
+  consume succeeds. Changing the ordering is an API-semantics decision and was
+  not taken here.
+- `/chat` has no idempotency key; retries still create one approval row per
+  request. That is an API change, explicitly out of scope.
+
 ## [0.5.2] — 2026-11-03
 
 Patch release: documentation verification boundaries plus two regression tests.

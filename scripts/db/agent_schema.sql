@@ -26,9 +26,13 @@ CREATE TABLE IF NOT EXISTS agent_approval (
     status TEXT NOT NULL DEFAULT 'pending',
     approver TEXT,
     consumed BOOLEAN NOT NULL DEFAULT FALSE,
+    consumed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE agent_approval
+    ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_agent_approval_tenant
     ON agent_approval(tenant_id, status);
