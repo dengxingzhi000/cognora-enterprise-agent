@@ -8,6 +8,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [0.5.9] — 2026-11-04
+
+Recover stale `started` write-tool effects automatically instead of leaving a
+permanent 409 that only a manual database edit can clear.
+
+### Added
+
+- `agent_tool_effect.last_error` (idempotent column + `ADD COLUMN IF NOT
+  EXISTS`).
+- Lazy stale reclaim: a `started` effect older than
+  `AGENT_TOOL_EFFECT_STALE_SECONDS` becomes `failed` with
+  `maybe_side_effect=TRUE` and the fixed `last_error`
+  `stale started effect reclaimed`, returning it to the one-retry budget
+  (`attempt < 2`). The predicate requires **all** of:
+  `status='started'`, `updated_at` older than the stale window, and the approval
+  no longer active (`status <> 'in_progress'`, `lease_until <= now()`, or the
+  approval row is gone). A live approval lease always blocks reclaim.
+- Default window derivation: `AGENT_TOOL_TIMEOUT_SECONDS` (120 s) +
+  `AGENT_APPROVAL_LEASE_SECONDS` (300 s) = **420 s**. A tool is allowed 120 s;
+  one lease on top ensures a crash right after a renewal has also lapsed
+  before anything is unlocked. Lowering it unlocks sooner with more
+  false-positive risk.
+- Reclaim runs at startup and with every lazy `reclaim_expired_claims()` in
+  resume — no host thread — and is idempotent (the conditional update hits 0
+  rows the second time).
+- `tool_effect_reclaimed_total` (memory backend and Prometheus `_counter`).
+- Read-only operator view `scripts/ops/stuck_tool_effects.py`: tenant,
+  approval, tool, first 8 chars of `args_hash`, status, attempt,
+  `maybe_side_effect`, `updated_at`, and the approval's status/lease. It
+  prints no plaintext args or results. Chosen over an admin endpoint because
+  it adds no network/auth surface and works while the app cannot start.
+
+### Testing
+
+- Crash scene (`started` + stale + expired approval lease) is reclaimed to
+  `failed(maybe_side_effect=true)`; the retry really executes (`invoked`
+  goes 1 → 2) and the next attempt is 409.
+- Negative case: stale `started` with an active approval lease is **not**
+  reclaimed and retries stay 409.
+- Two consecutive reclaim runs: the second returns 0 rows and the counter does
+  not double-count.
+- Metric check: `tool_effect_reclaimed_total` is 1 after one reclaim and the
+  rendered `/metrics` text contains it.
+- The operator view lists the stuck row and not the active one.
+- v0.5.8's 36 gate cases stay green; the default 420 s window is far above
+  test runtimes, so the existing "started → 409" case keeps its path.
+
+### Known limitations
+
+- Stale reclaim is a judgement, not proof: a genuinely slow tool whose approval
+  lease lapsed looks identical to a crashed one.
+- `maybe_side_effect=true` is information, not a rollback: the write may
+  already have happened.
+- A smaller `AGENT_TOOL_EFFECT_STALE_SECONDS` unlocks earlier but raises the
+  chance of a false reclaim.
+
 ## [0.5.8] — 2026-11-04
 
 Write-tool idempotency plus instance attribution: the covered crash replay

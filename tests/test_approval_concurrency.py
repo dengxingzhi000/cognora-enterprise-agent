@@ -299,6 +299,116 @@ def test_stale_claim_token_cannot_write_terminal_state(store, connector):
         _cleanup(connector, approval_id=aid)
 
 
+def _effect_store(connector):
+    from security.tool_effect import build_tool_effect_store
+
+    return build_tool_effect_store(connector)
+
+
+def _age_effect(connector, approval_id: str) -> None:
+    connector.execute(
+        "UPDATE agent_tool_effect SET updated_at = now() - INTERVAL '10 seconds' "
+        "WHERE approval_id = ?", (approval_id,))
+
+
+def test_stale_pg_effect_reclaimed_when_approval_inactive(store, connector):
+    """started + 过期 + approval 无活跃租约 → failed，可重试一次，第三次拒绝。"""
+    from security.tool_effect import CONFLICT, EXECUTE, STALE_STARTED_ERROR
+
+    effects = _effect_store(connector)
+    tenant = _tenant()
+    aid = store.request({"tenant_id": tenant, "user_id": "u1"},
+                        TOOL, {"sku": "X", "tenant_id": tenant})
+    store.approve(aid, "mgr-1")
+    args = {"sku": "X", "tenant_id": tenant}
+    try:
+        assert effects.begin(tenant, aid, TOOL, args)["decision"] == EXECUTE
+        _age_effect(connector, aid)
+
+        assert effects.reclaim_stale_started(stale_seconds=5, approvals=store) == 1
+        row = effects.get(tenant, aid, TOOL, args)
+        assert row["status"] == "failed" and row["maybe_side_effect"] is True, row
+        assert row["last_error"] == STALE_STARTED_ERROR, row
+        assert store.get(aid)["status"] == "approved"
+
+        retry = effects.begin(tenant, aid, TOOL, args)
+        assert retry["decision"] == EXECUTE and retry["attempt"] == 2, retry
+        assert effects.fail(tenant, aid, TOOL, args, maybe_side_effect=True) is True
+        assert effects.begin(tenant, aid, TOOL, args)["decision"] == CONFLICT
+    finally:
+        _cleanup(connector, approval_id=aid)
+
+
+def test_stale_pg_effect_not_reclaimed_while_approval_lease_is_live(store, connector):
+    """反例：approval 仍 in_progress 且租约活跃时绝不回收，重试仍 409。"""
+    from security.tool_effect import CONFLICT, EXECUTE
+
+    effects = _effect_store(connector)
+    tenant = _tenant()
+    aid = store.request({"tenant_id": tenant, "user_id": "u1"},
+                        TOOL, {"sku": "X", "tenant_id": tenant})
+    store.approve(aid, "mgr-1")
+    args = {"sku": "X", "tenant_id": tenant}
+    try:
+        store.claim(aid, lease_seconds=120)
+        assert effects.begin(tenant, aid, TOOL, args)["decision"] == EXECUTE
+        _age_effect(connector, aid)
+
+        assert effects.reclaim_stale_started(stale_seconds=5, approvals=store) == 0
+        row = effects.get(tenant, aid, TOOL, args)
+        assert row["status"] == "started", row
+        assert store.get(aid)["status"] == "in_progress"
+        assert effects.begin(tenant, aid, TOOL, args)["decision"] == CONFLICT
+    finally:
+        _cleanup(connector, approval_id=aid)
+
+
+def test_stale_pg_reclaim_is_idempotent(store, connector):
+    effects = _effect_store(connector)
+    tenant = _tenant()
+    aid = store.request({"tenant_id": tenant, "user_id": "u1"},
+                        TOOL, {"sku": "X", "tenant_id": tenant})
+    store.approve(aid, "mgr-1")
+    try:
+        effects.begin(tenant, aid, TOOL, {"sku": "X", "tenant_id": tenant})
+        _age_effect(connector, aid)
+        assert effects.reclaim_stale_started(stale_seconds=5, approvals=store) == 1
+        assert effects.reclaim_stale_started(stale_seconds=5, approvals=store) == 0
+    finally:
+        _cleanup(connector, approval_id=aid)
+
+
+def test_stale_pg_view_lists_stuck_only(store, connector):
+    """运维视图：列出无活跃租约的卡死行，不列出活跃执行行；不暴露明文。"""
+    from security.tool_effect import EXECUTE
+
+    effects = _effect_store(connector)
+    tenant = _tenant()
+    stuck = store.request({"tenant_id": tenant, "user_id": "u1"},
+                          TOOL, {"sku": "X", "tenant_id": tenant})
+    active = store.request({"tenant_id": tenant, "user_id": "u1"},
+                           TOOL, {"sku": "Y", "tenant_id": tenant})
+    store.approve(stuck, "mgr-1")
+    store.approve(active, "mgr-1")
+    try:
+        effects.begin(tenant, stuck, TOOL, {"sku": "X", "tenant_id": tenant})
+        _age_effect(connector, stuck)
+        store.claim(active, lease_seconds=120)
+        effects.begin(tenant, active, TOOL, {"sku": "Y", "tenant_id": tenant})
+        _age_effect(connector, active)
+
+        rows = effects.list_stale_started(stale_seconds=5, approvals=store)
+        ids = [r["approval_id"] for r in rows]
+        assert ids == [stuck], rows
+        row = rows[0]
+        assert row["approval_status"] == "approved", row
+        assert len(row["args_hash"]) == 64
+        assert "args" not in row and "result_ref" not in row
+    finally:
+        _cleanup(connector, approval_id=stuck)
+        _cleanup(connector, approval_id=active)
+
+
 def test_concurrent_paused_task_upsert_keeps_single_row(connector):
     """8 个线程对同一 (tenant_id, task_id) upsert：表里只有 1 行。"""
     from agent.runtime.paused_tasks import PausedTaskStore, PostgresPausedTaskRepository

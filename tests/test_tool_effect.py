@@ -3,6 +3,7 @@
 真实 Postgres 的占位/重试用例在 ``tests/test_approval_concurrency.py``。
 """
 import threading
+import time
 import uuid
 
 import pytest
@@ -221,3 +222,114 @@ def test_cached_decision_does_not_execute_and_returns_ref():
     assert cached["decision"] == CACHED
     assert cached["status"] == "succeeded"
     assert cached["result_ref"] == "sha256:abc"
+
+
+# --- v0.5.9: stale started effect reclaim ------------------------------------
+
+def _stuck_setup(*, active_lease: int | None = None):
+    approvals = ApprovalStore(InMemoryApprovalRepository())
+    aid = approvals.request({"tenant_id": "t1", "user_id": "u1"}, TOOL, {"sku": "X"})
+    approvals.approve(aid, "mgr-1")
+    if active_lease is not None:
+        approvals.claim(aid, lease_seconds=active_lease)
+    effects = _effects()
+    assert effects.begin("t1", aid, TOOL, {"sku": "X"})["decision"] == EXECUTE
+    # 模拟崩溃：started 行在很久之前创建。
+    effects.get("t1", aid, TOOL, {"sku": "X"})["updated_at"] = time.monotonic() - 10
+    return approvals, effects, aid
+
+
+def test_stale_started_effect_reclaimed_then_one_retry_is_allowed():
+    from security.tool_effect import STALE_STARTED_ERROR
+
+    approvals, effects, aid = _stuck_setup()
+    assert effects.reclaim_stale_started(stale_seconds=5, approvals=approvals) == 1
+
+    row = effects.get("t1", aid, TOOL, {"sku": "X"})
+    assert row["status"] == "failed", row
+    assert row["maybe_side_effect"] is True, row
+    assert row["last_error"] == STALE_STARTED_ERROR, row
+    assert approvals.get(aid)["status"] == "approved"
+
+    retry = effects.begin("t1", aid, TOOL, {"sku": "X"})
+    assert retry["decision"] == EXECUTE and retry["attempt"] == 2, retry
+    assert effects.fail("t1", aid, TOOL, {"sku": "X"}, maybe_side_effect=True) is True
+    third = effects.begin("t1", aid, TOOL, {"sku": "X"})
+    assert third["decision"] == CONFLICT
+    assert third["reason"] == "retry budget exhausted", third
+
+
+def test_stale_started_effect_is_not_reclaimed_while_approval_lease_is_live():
+    approvals, effects, aid = _stuck_setup(active_lease=120)
+    assert effects.reclaim_stale_started(stale_seconds=5, approvals=approvals) == 0
+
+    row = effects.get("t1", aid, TOOL, {"sku": "X"})
+    assert row["status"] == "started", row
+    assert approvals.get(aid)["status"] == "in_progress"
+    blocked = effects.begin("t1", aid, TOOL, {"sku": "X"})
+    assert blocked["decision"] == CONFLICT, blocked
+
+
+def test_stale_reclaim_is_idempotent_and_counts_once():
+    from observability import metrics
+
+    backend = metrics.configure_metrics(memory=True)
+    try:
+        approvals, effects, aid = _stuck_setup()
+        assert effects.reclaim_stale_started(stale_seconds=5, approvals=approvals) == 1
+        assert effects.reclaim_stale_started(stale_seconds=5, approvals=approvals) == 0
+        assert backend.value("tool_effect_reclaimed_total") == 1
+        payload, _ = metrics.render_metrics()
+        assert b"tool_effect_reclaimed_total 1" in payload
+    finally:
+        metrics.reset_metrics()
+
+
+def test_stale_view_lists_stuck_row_but_not_active_row():
+    approvals, effects, stuck = _stuck_setup()
+    active = approvals.request({"tenant_id": "t1", "user_id": "u1"},
+                               TOOL, {"sku": "X"})
+    approvals.approve(active, "mgr-1")
+    approvals.claim(active, lease_seconds=120)
+    assert effects.begin("t1", active, TOOL, {"sku": "X"})["decision"] == EXECUTE
+    effects.get("t1", active, TOOL, {"sku": "X"})["updated_at"] = time.monotonic() - 10
+
+    rows = effects.list_stale_started(stale_seconds=5, approvals=approvals)
+    assert [r["approval_id"] for r in rows] == [stuck], rows
+    assert rows[0]["args_hash"][:8] == args_hash({"sku": "X"})[:8]
+    assert rows[0]["approval_status"] == "approved"
+    assert "args" not in rows[0] and "result_ref" not in rows[0]
+
+
+def test_stale_reclaim_then_retry_really_executes(monkeypatch):
+    """崩溃 → stale 回收 → 重试真的调用工具：invoked 1 → 2，第三次 409。"""
+    client, approvals, effects, registry = _prepare(monkeypatch)
+    monkeypatch.setenv("AGENT_TOOL_EFFECT_STALE_SECONDS", "1")
+    monkeypatch.setenv("AGENT_APPROVAL_LEASE_SECONDS", "1")
+
+    tenant, task_id = _pause_and_approve(client)
+    aid = _last_aid(approvals, tenant)
+    args = approvals.get(aid)["args"]
+
+    def boom(*a, **kw):
+        raise RuntimeError("simulated crash before result write")
+
+    monkeypatch.setattr(effects, "succeed", boom)
+    with pytest.raises(RuntimeError):
+        client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
+    assert registry.calls == 1
+    row = effects.get(tenant, aid, TOOL, args)
+    assert row["status"] == "started", row
+
+    time.sleep(1.4)  # 审批租约与 stale 窗口都过期
+
+    # 第二次：回收 approval + 回收 stale effect，重试确实执行（invoked=2）。
+    with pytest.raises(RuntimeError):
+        client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
+    assert registry.calls == 2, "stale reclaim must allow a real retry"
+    row = effects.get(tenant, aid, TOOL, args)
+    assert row["status"] == "started" and row["attempt"] == 2, row
+
+    third = client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
+    assert third.status_code == 409, third.text
+    assert registry.calls == 2

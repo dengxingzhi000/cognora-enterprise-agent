@@ -15,12 +15,51 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 
 from infrastructure.pg.connector import get_agent_connector
 
 MAX_TOOL_EFFECT_ATTEMPTS = 2
+STALE_STARTED_ERROR = "stale started effect reclaimed"
+
+
+def tool_effect_stale_seconds() -> int:
+    """``started`` 占位的过期窗口。
+
+    默认 = 工具超时（``AGENT_TOOL_TIMEOUT_SECONDS``，默认 120s）+ 一个审批租约
+    （``AGENT_APPROVAL_LEASE_SECONDS``，默认 300s）= 420s：超时是工具允许的最长
+    执行时间，再加一个租约确保即使崩溃发生在心跳续期前后，审批行也已自然过期；
+    真正回收时还会再次校验 approval 不持有活跃租约，所以窗口只是保守门槛。
+    """
+    raw = os.getenv("AGENT_TOOL_EFFECT_STALE_SECONDS")
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    from agent.tools.executor import tool_timeout_seconds
+    from security.approval import approval_lease_seconds
+
+    return tool_timeout_seconds() + approval_lease_seconds()
+
+
+def _approval_active(approvals, approval_id: str) -> bool:
+    """approval 是否仍持有活跃执行租约；查询失败按「未知」处理为活跃（不回收）。"""
+    if approvals is None:
+        return True
+    try:
+        item = approvals.get(approval_id)
+    except Exception:  # noqa: BLE001 - 查不到按活跃处理，绝不误回收
+        return True
+    if item.get("status") != "in_progress":
+        return False
+    until = item.get("lease_until")
+    return until is not None and until > time.monotonic()
+
 
 # 参数里不影响「这是什么动作」的易变字段；比较前递归剔除。
 VOLATILE_ARG_KEYS = frozenset({
@@ -75,7 +114,7 @@ class InMemoryToolEffectRepository:
                     "tenant_id": key[0], "approval_id": key[1], "tool_name": key[2],
                     "args_hash": key[3], "status": "started", "attempt": 1,
                     "result_ref": None, "maybe_side_effect": False,
-                    "created_at": now, "updated_at": now,
+                    "last_error": None, "created_at": now, "updated_at": now,
                 }
                 return {"decision": EXECUTE, "attempt": 1, "status": "started",
                         "result_ref": None, "maybe_side_effect": False}
@@ -96,6 +135,7 @@ class InMemoryToolEffectRepository:
             row["attempt"] += 1
             row["result_ref"] = None
             row["maybe_side_effect"] = False
+            row["last_error"] = None
             row["updated_at"] = now
             return {"decision": EXECUTE, "attempt": row["attempt"], "status": "started",
                     "result_ref": None, "maybe_side_effect": False}
@@ -120,8 +160,53 @@ class InMemoryToolEffectRepository:
                 return False
             row["status"] = "failed"
             row["maybe_side_effect"] = bool(maybe_side_effect)
+            row["last_error"] = None
             row["updated_at"] = time.monotonic()
             return True
+
+    def reclaim_stale_started(self, stale_seconds: int, approvals) -> int:
+        """回收崩溃遗留的 ``started``：仅当过期且 approval 已无活跃租约。"""
+        threshold = time.monotonic() - max(1, int(stale_seconds))
+        count = 0
+        with self._lock:
+            for row in self._items.values():
+                if row["status"] != "started" or row["updated_at"] > threshold:
+                    continue
+                if _approval_active(approvals, row["approval_id"]):
+                    continue
+                row["status"] = "failed"
+                row["maybe_side_effect"] = True
+                row["last_error"] = STALE_STARTED_ERROR
+                row["updated_at"] = time.monotonic()
+                count += 1
+        return count
+
+    def list_stale_started(self, stale_seconds: int, approvals) -> list[dict]:
+        threshold = time.monotonic() - max(1, int(stale_seconds))
+        rows = []
+        with self._lock:
+            for row in self._items.values():
+                if row["status"] != "started" or row["updated_at"] > threshold:
+                    continue
+                if _approval_active(approvals, row["approval_id"]):
+                    continue
+                try:
+                    approval = approvals.get(row["approval_id"])
+                except Exception:  # noqa: BLE001 - 视图允许审批已不存在
+                    approval = {}
+                rows.append({
+                    "tenant_id": row["tenant_id"],
+                    "approval_id": row["approval_id"],
+                    "tool_name": row["tool_name"],
+                    "args_hash": row["args_hash"],
+                    "status": row["status"],
+                    "attempt": row["attempt"],
+                    "maybe_side_effect": row["maybe_side_effect"],
+                    "updated_at": row["updated_at"],
+                    "approval_status": approval.get("status"),
+                    "approval_lease_until": approval.get("lease_until"),
+                })
+        return sorted(rows, key=lambda r: r["updated_at"])
 
     def get(self, tenant_id, approval_id, tool_name, args):
         return self._items.get(effect_key(tenant_id, approval_id, tool_name, args))
@@ -187,7 +272,7 @@ class PostgresToolEffectRepository:
     def succeed(self, tenant_id, approval_id, tool_name, args, ref):
         return bool(self._c.execute_rowcount(
             "UPDATE agent_tool_effect SET status = 'succeeded', result_ref = ?, "
-            "maybe_side_effect = FALSE, updated_at = now() "
+            "maybe_side_effect = FALSE, last_error = NULL, updated_at = now() "
             "WHERE tenant_id = ? AND approval_id = ? AND tool_name = ? AND args_hash = ? "
             "AND status = 'started'",
             (ref, tenant_id or "default", approval_id, tool_name, args_hash(args)),
@@ -196,17 +281,45 @@ class PostgresToolEffectRepository:
     def fail(self, tenant_id, approval_id, tool_name, args, *, maybe_side_effect: bool):
         return bool(self._c.execute_rowcount(
             "UPDATE agent_tool_effect SET status = 'failed', maybe_side_effect = ?, "
-            "updated_at = now() "
+            "last_error = NULL, updated_at = now() "
             "WHERE tenant_id = ? AND approval_id = ? AND tool_name = ? AND args_hash = ? "
             "AND status = 'started'",
             (bool(maybe_side_effect), tenant_id or "default", approval_id, tool_name,
              args_hash(args)),
         ))
 
+    def reclaim_stale_started(self, stale_seconds: int, approvals=None) -> int:
+        """条件 UPDATE：status=started + 已过期 + approval 无活跃租约。"""
+        return self._c.execute_rowcount(
+            "UPDATE agent_tool_effect AS e "
+            "SET status = 'failed', maybe_side_effect = TRUE, "
+            "last_error = 'stale started effect reclaimed', updated_at = now() "
+            "WHERE e.status = 'started' "
+            "AND e.updated_at < now() - (?::double precision * INTERVAL '1 second') "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM agent_approval AS a WHERE a.id = e.approval_id "
+            "  AND a.status = 'in_progress' AND a.lease_until > now())",
+            (max(1, int(stale_seconds)),),
+        )
+
+    def list_stale_started(self, stale_seconds: int, approvals=None) -> list[dict]:
+        return self._c.fetch_all(
+            "SELECT e.tenant_id, e.approval_id, e.tool_name, e.args_hash, e.status, "
+            "e.attempt, e.maybe_side_effect, e.updated_at, "
+            "a.status AS approval_status, a.lease_until AS approval_lease_until "
+            "FROM agent_tool_effect AS e "
+            "LEFT JOIN agent_approval AS a ON a.id = e.approval_id "
+            "WHERE e.status = 'started' "
+            "AND e.updated_at < now() - (?::double precision * INTERVAL '1 second') "
+            "AND (a.id IS NULL OR a.status <> 'in_progress' OR a.lease_until <= now()) "
+            "ORDER BY e.updated_at",
+            (max(1, int(stale_seconds)),),
+        )
+
     def get(self, tenant_id, approval_id, tool_name, args):
         return self._c.fetch_one(
             "SELECT tenant_id, approval_id, tool_name, args_hash, status, attempt, "
-            "result_ref, maybe_side_effect, created_at, updated_at "
+            "result_ref, maybe_side_effect, last_error, created_at, updated_at "
             "FROM agent_tool_effect "
             "WHERE tenant_id = ? AND approval_id = ? AND tool_name = ? AND args_hash = ?",
             (tenant_id or "default", approval_id, tool_name, args_hash(args)))
@@ -214,7 +327,7 @@ class PostgresToolEffectRepository:
     def list_items(self):
         return self._c.fetch_all(
             "SELECT tenant_id, approval_id, tool_name, args_hash, status, attempt, "
-            "result_ref, maybe_side_effect, created_at, updated_at "
+            "result_ref, maybe_side_effect, last_error, created_at, updated_at "
             "FROM agent_tool_effect ORDER BY created_at")
 
     def delete_by_approval(self, approval_id):
@@ -237,6 +350,19 @@ class ToolEffectStore:
     def fail(self, tenant_id, approval_id, tool_name, args, *, maybe_side_effect: bool):
         return self._repo.fail(tenant_id, approval_id, tool_name, args,
                                maybe_side_effect=maybe_side_effect)
+
+    def reclaim_stale_started(self, approvals=None, stale_seconds=None) -> int:
+        seconds = tool_effect_stale_seconds() if stale_seconds is None else int(stale_seconds)
+        count = self._repo.reclaim_stale_started(seconds, approvals)
+        if count:
+            from observability import metrics as _metrics
+
+            _metrics.inc_tool_effect_reclaimed(count)
+        return count
+
+    def list_stale_started(self, approvals=None, stale_seconds=None) -> list[dict]:
+        seconds = tool_effect_stale_seconds() if stale_seconds is None else int(stale_seconds)
+        return self._repo.list_stale_started(seconds, approvals)
 
     def get(self, tenant_id, approval_id, tool_name, args):
         return self._repo.get(tenant_id, approval_id, tool_name, args)
