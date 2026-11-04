@@ -61,11 +61,12 @@ def test_approval_postgres_roundtrip(connector):
 
         claimed = store.claim(aid)
         assert claimed["status"] == "in_progress"
+        token = claimed["claim_token"]
 
-        completed = store.complete(aid)
+        completed = store.complete(aid, token)
         assert completed["consumed"] is True
         with pytest.raises(ValueError):
-            store.complete(aid)
+            store.complete(aid, token)
 
         listed = [i for i in store.list_items() if i["id"] == aid]
         assert len(listed) == 1

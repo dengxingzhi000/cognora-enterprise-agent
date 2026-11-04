@@ -47,12 +47,14 @@ class UvicornProc:
     """A real ``uvicorn`` subprocess we can SIGKILL and start again."""
 
     def __init__(self, counter_path: str, sleep_seconds: float, *, fail: bool = False,
-                 lease_seconds: int = LEASE_SECONDS, heartbeat: bool = True):
+                 lease_seconds: int = LEASE_SECONDS, heartbeat: bool = True,
+                 timeout_seconds: float | None = None):
         self.counter = counter_path
         self.sleep = sleep_seconds
         self.fail = fail
         self.lease_seconds = lease_seconds
         self.heartbeat = heartbeat
+        self.timeout_seconds = timeout_seconds
         self.proc = None
         self.port = None
 
@@ -65,6 +67,8 @@ class UvicornProc:
         env["AGENT_DRILL_FAIL"] = "1" if self.fail else "0"
         env["AGENT_APPROVAL_LEASE_SECONDS"] = str(self.lease_seconds)
         env["AGENT_APPROVAL_HEARTBEAT_ENABLED"] = "1" if self.heartbeat else "0"
+        if self.timeout_seconds is not None:
+            env["AGENT_TOOL_TIMEOUT_SECONDS"] = str(self.timeout_seconds)
         env.pop("AGENT_PG_OFFLINE", None)
         env.pop("PG_OFFLINE", None)
         cmd = [
@@ -550,6 +554,51 @@ def test_without_heartbeat_lease_expires_mid_run(db, tmp_path):
         assert lines.count("invoked") == 2, lines  # 原始执行 + 1 次重放
         assert lines.count("finished") == 2, lines
         assert _approval_row(db, aid)["consumed"] is True
+    finally:
+        app.stop()
+        _cleanup(db, tenant, task_id, aid)
+
+
+# --- case 7: a stuck tool times out into a terminal failed state ------------
+
+def test_stuck_tool_times_out_instead_of_heartbeat_forever(db, tmp_path):
+    """工具卡死 6s、超时 1s：心跳虽然续期也只能撑到超时，之后行必须 failed。
+
+    反证「心跳会让卡死工具永远停在 in_progress」：超时是终态，心跳随 finally 停止。
+    """
+    tenant = _tenant()
+    counter = str(tmp_path / "counter.txt")
+    app = UvicornProc(counter, 6.0, lease_seconds=2, timeout_seconds=1.0).start()
+    task_id = aid = None
+    try:
+        task_id, aid = _pause_for_approval(app, tenant)
+        status, body = _approve(app, aid, tenant)
+        assert status == 200 and body["status"] == "approved", body
+
+        status, body = _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
+        assert status == 504, body
+        assert body["detail"] == "approved action timed out", body
+
+        row = db.fetch_one(
+            "SELECT status, consumed, last_error FROM agent_approval WHERE id = ?",
+            (aid,))
+        assert row["status"] == "failed", row
+        assert row["consumed"] is False, row
+        assert row["last_error"] == "tool timeout", row
+
+        # 心跳已停：把租约快进到过期再回收，failed 是终态，不会被改回 approved。
+        db.execute("UPDATE agent_approval SET lease_until = now() - INTERVAL '1 second' "
+                   "WHERE id = ?", (aid,))
+        _repo(db).reclaim_expired_claims()
+        row = db.fetch_one(
+            "SELECT status, consumed FROM agent_approval WHERE id = ?", (aid,))
+        assert row["status"] == "failed" and row["consumed"] is False, row
+
+        # failed 是终态：再次 resume 是 409，且不会重放工具。
+        status, body = _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
+        assert status == 409, body
+        assert "not approved" in body.get("detail", ""), body
+        assert _counter_lines(counter).count("invoked") == 1
     finally:
         app.stop()
         _cleanup(db, tenant, task_id, aid)

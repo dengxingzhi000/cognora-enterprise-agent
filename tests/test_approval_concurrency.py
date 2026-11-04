@@ -64,19 +64,19 @@ def test_concurrent_claim_only_one_wins(store, connector):
     def worker(_):
         barrier.wait()
         try:
-            store.claim(aid)
-            return "ok"
+            return store.claim(aid)["claim_token"]
         except ValueError:
-            return "conflict"
+            return None
 
     try:
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(worker, range(4)))
-        assert results.count("ok") == 1, results
-        assert results.count("conflict") == 3, results
+        tokens = [r for r in results if r]
+        assert len(tokens) == 1, results
+        assert results.count(None) == 3, results
         assert store.get(aid)["status"] == "in_progress"
         assert store.get(aid)["consumed"] is False
-        assert store.complete(aid)["consumed"] is True
+        assert store.complete(aid, tokens[0])["consumed"] is True
         assert store.get(aid)["status"] == "done"
     finally:
         _cleanup(connector, approval_id=aid)
@@ -96,9 +96,9 @@ def test_expired_lease_is_reclaimed(store, connector):
         assert store.reclaim_expired_claims() >= 1
         assert store.get(aid)["status"] == "approved"
 
-        store.claim(aid, lease_seconds=60)
+        token = store.claim(aid, lease_seconds=60)["claim_token"]
         assert store.get(aid)["status"] == "in_progress"
-        assert store.complete(aid)["status"] == "done"
+        assert store.complete(aid, token)["status"] == "done"
     finally:
         _cleanup(connector, approval_id=aid)
 
@@ -110,16 +110,16 @@ def test_renew_extends_live_lease(store, connector):
                         TOOL, {"sku": "X", "tenant_id": tenant})
     store.approve(aid, "mgr-1")
     try:
-        store.claim(aid, lease_seconds=1)
+        token = store.claim(aid, lease_seconds=1)["claim_token"]
         for _ in range(8):
-            assert store.renew(aid, 1) is True
+            assert store.renew(aid, token, 1) is True
             time.sleep(0.2)  # 累计 1.6s > 1s 原始租约
         assert store.get(aid)["status"] == "in_progress"
         live = connector.fetch_one(
             "SELECT (lease_until > now()) AS live FROM agent_approval WHERE id = ?",
             (aid,))
         assert live["live"] is True, live
-        store.complete(aid)
+        store.complete(aid, token)
     finally:
         _cleanup(connector, approval_id=aid)
 
@@ -133,15 +133,15 @@ def test_reclaimed_row_is_not_renewed(store, connector):
                         TOOL, {"sku": "X", "tenant_id": tenant})
     store.approve(aid, "mgr-1")
     try:
-        store.claim(aid, lease_seconds=1)
+        token_a = store.claim(aid, lease_seconds=1)["claim_token"]
         time.sleep(1.4)
         assert store.reclaim_expired_claims() >= 1
         assert store.get(aid)["status"] == "approved"
 
-        # 续期条件更新含 status='in_progress' AND lease_until > now()，故 0 行。
-        assert store.renew(aid, 30) is False
+        # 续期条件更新含 status='in_progress' / claim_token / lease_until > now()，故 0 行。
+        assert store.renew(aid, token_a, 30) is False
 
-        heartbeat = LeaseHeartbeat(store, aid, lease_seconds=1, interval=0.1).start()
+        heartbeat = LeaseHeartbeat(store, aid, token_a, lease_seconds=1, interval=0.1).start()
         try:
             deadline = time.time() + 2.0
             while time.time() < deadline and not heartbeat.lost:
@@ -151,8 +151,9 @@ def test_reclaimed_row_is_not_renewed(store, connector):
             heartbeat.stop()
 
         # 回收后可以重新 claim 执行
-        assert store.claim(aid, lease_seconds=30)["status"] == "in_progress"
-        assert store.complete(aid)["status"] == "done"
+        token_b = store.claim(aid, lease_seconds=30)["claim_token"]
+        assert store.get(aid)["status"] == "in_progress"
+        assert store.complete(aid, token_b)["status"] == "done"
     finally:
         _cleanup(connector, approval_id=aid)
 
@@ -185,6 +186,44 @@ def test_concurrent_approve_and_reject_one_wins(store, connector):
         winner = results[0] if results[0] != "conflict" else results[1]
         assert winner in ("approved", "rejected")
         assert store.get(aid)["status"] == winner
+    finally:
+        _cleanup(connector, approval_id=aid)
+
+
+def test_stale_claim_token_cannot_write_terminal_state(store, connector):
+    """A 的租约被回收、B 重新 claim 后，A 用旧 token 写终态必须 0 行。
+
+    行的 status / consumed / claim_token 全部保持 B 的值，A 不能覆盖。
+    """
+    tenant = _tenant()
+    aid = store.request({"tenant_id": tenant, "user_id": "u1"},
+                        TOOL, {"sku": "X", "tenant_id": tenant})
+    store.approve(aid, "mgr-1")
+    try:
+        token_a = store.claim(aid, lease_seconds=1)["claim_token"]
+        time.sleep(1.4)
+        assert store.reclaim_expired_claims() >= 1
+        token_b = store.claim(aid, lease_seconds=60)["claim_token"]
+        assert token_b != token_a
+
+        before = store.get(aid)
+        assert before["status"] == "in_progress"
+        assert before["consumed"] is False
+        assert before["claim_token"] == token_b
+
+        with pytest.raises(ValueError):
+            store.complete(aid, token_a)
+        with pytest.raises(ValueError):
+            store.fail(aid, token_a, "stale token")
+
+        after = store.get(aid)
+        assert after["status"] == "in_progress", after
+        assert after["consumed"] is False, after
+        assert after["claim_token"] == token_b, after
+        assert after["last_error"] is None, after
+
+        # B 仍可正常完成。
+        assert store.complete(aid, token_b)["status"] == "done"
     finally:
         _cleanup(connector, approval_id=aid)
 

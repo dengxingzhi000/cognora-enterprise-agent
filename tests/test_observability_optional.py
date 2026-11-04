@@ -2,17 +2,34 @@
 import pytest
 
 
-def test_metrics_503_without_prometheus_client(monkeypatch):
+def test_metrics_falls_back_to_memory_without_prometheus_client(monkeypatch):
+    """无 prometheus-client 时仍计数，并通过 /metrics 以文本暴露（不再 503）。"""
     from observability import metrics
-    monkeypatch.setattr(metrics, "_BACKEND", metrics.NoopMetrics())
-    from fastapi.testclient import TestClient
-    from apps.api.main import app
-    client = TestClient(app)
-    r = client.get("/metrics")
-    assert r.status_code == 503
-    assert "prometheus-client" in r.json()["detail"]
-    with pytest.raises(metrics.MetricsUnavailable):
-        metrics.render_metrics()
+
+    backend = metrics.configure_metrics(memory=True)
+    try:
+        assert metrics.metrics_available() is False
+        metrics.inc_task_status("done")
+        metrics.inc_approval_reclaimed()
+        metrics.inc_approval_lease_lost()
+        metrics.inc_approval_heartbeat_failed()
+        payload, content_type = metrics.render_metrics()
+        text = payload.decode()
+        assert "agent_task_total{status=\"done\"} 1" in text
+        assert "approval_reclaimed_total 1" in text
+        assert "approval_lease_lost_total 1" in text
+        assert "approval_heartbeat_failed_total 1" in text
+        assert "text/plain" in content_type
+        assert backend.value("approval_reclaimed_total") == 1
+
+        from fastapi.testclient import TestClient
+        from apps.api.main import app
+        client = TestClient(app)
+        r = client.get("/metrics")
+        assert r.status_code == 200
+        assert "approval_reclaimed_total 1" in r.text
+    finally:
+        metrics.reset_metrics()
 
 
 def test_metrics_renders_when_prometheus_client_available():
@@ -38,12 +55,20 @@ def test_metrics_renders_when_prometheus_client_available():
     assert "agent_task_total" in r.text
 
 
-def test_metrics_recording_is_noop_when_backend_unavailable(monkeypatch):
+def test_metrics_recording_still_counts_on_memory_backend():
     from observability import metrics
-    monkeypatch.setattr(metrics, "_BACKEND", metrics.NoopMetrics())
-    metrics.inc_task_status("failed")
-    metrics.record_tool_call("unknown", False)
-    metrics.record_trace_event("x")
+
+    backend = metrics.configure_metrics(memory=True)
+    try:
+        metrics.inc_task_status("failed")
+        metrics.record_tool_call("unknown", False)
+        metrics.record_trace_event("x")
+        assert backend.value("agent_task_total", {"status": "failed"}) == 1
+        assert backend.value("agent_tool_calls_total",
+                             {"tool": "unknown", "result": "error"}) == 1
+        assert backend.value("agent_trace_events_total", {"stage": "x"}) == 1
+    finally:
+        metrics.reset_metrics()
 
 
 class _FakeSpan:

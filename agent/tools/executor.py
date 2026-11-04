@@ -1,11 +1,58 @@
 """Registry Executor: 把 Planner 的 call_tool 翻译成真实调用。工具失败→Observation，不抛异常。"""
 import logging
+import os
+import threading
 
 from .builtin import build_default_registry
 
 logger = logging.getLogger(__name__)
 
 _default_registry = None
+
+# 单个工具调用的上限。SCM 写接口正常应在数秒内返回；120s 足够覆盖重试与
+# 慢查询，同时避免卡死的工具靠心跳续命把审批单永久占在 in_progress。
+DEFAULT_TOOL_TIMEOUT_SECONDS = 120
+
+
+class ToolTimeout(RuntimeError):
+    """工具调用超过 ``AGENT_TOOL_TIMEOUT_SECONDS``。"""
+
+
+def tool_timeout_seconds() -> float:
+    """工具超时（秒）；未配置/非法/非正数回落默认 120s。"""
+    raw = os.environ.get("AGENT_TOOL_TIMEOUT_SECONDS")
+    if not raw:
+        return float(DEFAULT_TOOL_TIMEOUT_SECONDS)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(DEFAULT_TOOL_TIMEOUT_SECONDS)
+    return value if value > 0 else float(DEFAULT_TOOL_TIMEOUT_SECONDS)
+
+
+def execute_with_timeout(fn, timeout_seconds: float | None = None):
+    """在工作线程里执行 ``fn`` 并等待；超时抛 ``ToolTimeout``。
+
+    线程无法被强制终止：超时后调用方必须放弃该执行并写终态，被放弃的线程
+    可能仍会跑完（这是工具缺幂等键时无法消除的残余风险）。
+    """
+    timeout = tool_timeout_seconds() if timeout_seconds is None else float(timeout_seconds)
+    box: dict = {}
+
+    def _target():
+        try:
+            box["result"] = fn()
+        except BaseException as e:  # noqa: BLE001 - 原样抛回调用线程
+            box["error"] = e
+
+    thread = threading.Thread(target=_target, name="tool-execution", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise ToolTimeout(f"tool did not finish within {timeout}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
 
 
 def _registry():
