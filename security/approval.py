@@ -7,9 +7,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 import warnings
 from itertools import count
+
+
+class ApprovalConflict(ValueError):
+    """并发下审批状态已被其他请求改写；调用方应按 409 处理。"""
 
 
 class ApprovalRepository:
@@ -25,36 +30,43 @@ class InMemoryApprovalRepository(ApprovalRepository):
     def __init__(self):
         self._items: dict[str, dict] = {}
         self._seq = count(1)
+        self._lock = threading.Lock()
 
     def create(self, user: dict, tool: str, args: dict) -> str:
         aid = f"apr-{next(self._seq)}"
-        self._items[aid] = {"id": aid, "user": user or {}, "tool": tool,
-                            "args": args or {}, "status": "pending"}
+        with self._lock:
+            self._items[aid] = {"id": aid, "user": user or {}, "tool": tool,
+                                "args": args or {}, "status": "pending"}
         return aid
 
     def get(self, approval_id: str) -> dict:
         return self._items[approval_id]
 
+    def _set_status(self, approval_id: str, status: str, approver: str) -> dict:
+        with self._lock:
+            item = self._items[approval_id]
+            if item["status"] != "pending":
+                raise ApprovalConflict(
+                    f"approval {approval_id} is {item['status']}, not pending")
+            item["status"] = status
+            item["approver"] = approver
+            return item
+
     def approve(self, approval_id: str, approver: str) -> dict:
-        item = self._items[approval_id]
-        item["status"] = "approved"
-        item["approver"] = approver
-        return item
+        return self._set_status(approval_id, "approved", approver)
 
     def reject(self, approval_id: str, approver: str) -> dict:
-        item = self._items[approval_id]
-        item["status"] = "rejected"
-        item["approver"] = approver
-        return item
+        return self._set_status(approval_id, "rejected", approver)
 
     def consume(self, approval_id: str) -> dict:
-        item = self._items[approval_id]
-        if item["status"] != "approved":
-            raise ValueError(f"approval {approval_id} is {item['status']}, not approved")
-        if item.get("consumed"):
-            raise ValueError(f"approval {approval_id} already consumed")
-        item["consumed"] = True
-        return item
+        with self._lock:
+            item = self._items[approval_id]
+            if item["status"] != "approved":
+                raise ValueError(f"approval {approval_id} is {item['status']}, not approved")
+            if item.get("consumed"):
+                raise ValueError(f"approval {approval_id} already consumed")
+            item["consumed"] = True
+            return item
 
     def list_items(self) -> list[dict]:
         return list(self._items.values())
@@ -109,11 +121,14 @@ class PostgresApprovalRepository(ApprovalRepository):
         return self._row(row)
 
     def _set_status(self, approval_id: str, status: str, approver: str) -> dict:
-        self.get(approval_id)  # 不存在 → KeyError
-        self._c.execute(
+        # 单条条件更新：并发 approve/reject 只有一个能把 pending 改走。
+        updated = self._c.execute_rowcount(
             "UPDATE agent_approval SET status = ?, approver = ?, updated_at = now() "
-            "WHERE id = ?", (status, approver, approval_id))
-        return self.get(approval_id)
+            "WHERE id = ? AND status = 'pending'", (status, approver, approval_id))
+        if updated:
+            return self.get(approval_id)
+        item = self.get(approval_id)  # 不存在 → KeyError
+        raise ApprovalConflict(f"approval {approval_id} is {item['status']}, not pending")
 
     def approve(self, approval_id: str, approver: str) -> dict:
         return self._set_status(approval_id, "approved", approver)
@@ -122,15 +137,17 @@ class PostgresApprovalRepository(ApprovalRepository):
         return self._set_status(approval_id, "rejected", approver)
 
     def consume(self, approval_id: str) -> dict:
+        # 单条条件更新：并发 consume 只有一个能把 consumed 从 FALSE 改走。
+        updated = self._c.execute_rowcount(
+            "UPDATE agent_approval SET consumed = TRUE, consumed_at = now(), "
+            "updated_at = now() WHERE id = ? AND consumed = FALSE AND status = 'approved'",
+            (approval_id,))
+        if updated:
+            return self.get(approval_id)
         item = self.get(approval_id)
         if item["status"] != "approved":
             raise ValueError(f"approval {approval_id} is {item['status']}, not approved")
-        if item.get("consumed"):
-            raise ValueError(f"approval {approval_id} already consumed")
-        self._c.execute(
-            "UPDATE agent_approval SET consumed = TRUE, updated_at = now() WHERE id = ?",
-            (approval_id,))
-        return self.get(approval_id)
+        raise ValueError(f"approval {approval_id} already consumed")
 
     def list_items(self) -> list[dict]:
         rows = self._c.fetch_all(

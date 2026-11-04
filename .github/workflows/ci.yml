@@ -23,6 +23,21 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: db_agent
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -32,15 +47,30 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
+      - name: Init agent schema
+        run: >-
+          psql -h 127.0.0.1 -U postgres -d db_agent -v ON_ERROR_STOP=1
+          -f scripts/db/agent_schema.sql
       - name: Test
-        # -rs prints skip reasons. This job intentionally has no
-        # AGENT_TEST_PG_DSN, DEEPSEEK_API_KEY, or SCM_GATEWAY_URL, so the
-        # Postgres/pgvector integration cases and the optional-dependency
-        # probes skip by design; the remaining offline suite must stay green.
+        # -rs prints skip reasons. The one-shot Postgres service is local to the
+        # runner (trust auth, no credentials in logs) and backs the real-PG
+        # cases; DEEPSEEK_API_KEY and SCM_GATEWAY_URL stay unset, so the
+        # optional-dependency and pgvector probes still skip by design.
+        env:
+          AGENT_TEST_PG_DSN: postgresql://postgres@127.0.0.1:5432/db_agent
         run: pytest -q -rs
+      - name: Concurrency cases must run, not skip
+        env:
+          AGENT_TEST_PG_DSN: postgresql://postgres@127.0.0.1:5432/db_agent
+        run: |
+          pytest -q -rs tests/test_approval_concurrency.py | tee concurrency.txt
+          if grep -q "skipped" concurrency.txt; then
+            echo "::error::concurrency cases were skipped; a DSN must be configured"
+            exit 1
+          fi
       - name: Explain skipped integration tests
         if: always()
         run: |
-          echo "No AGENT_TEST_PG_DSN / DEEPSEEK_API_KEY / SCM_GATEWAY_URL is configured in CI."
-          echo "Postgres/pgvector integration tests are skipif-gated and optional deps are probed;"
-          echo "see README.md 'Postgres persistence setup' and the optional groups in pyproject.toml."
+          echo "AGENT_TEST_PG_DSN points at the one-shot Postgres service, so real-PG"
+          echo "cases run here. pgvector, DeepSeek and SCM gateway paths still skip;"
+          echo "see README.md 'Postgres persistence setup' and pyproject.toml extras."
