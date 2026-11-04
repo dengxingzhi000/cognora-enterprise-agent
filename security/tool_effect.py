@@ -295,7 +295,8 @@ class PostgresToolEffectRepository:
             "SET status = 'failed', maybe_side_effect = TRUE, "
             "last_error = 'stale started effect reclaimed', updated_at = now() "
             "WHERE e.status = 'started' "
-            "AND e.updated_at < now() - (?::double precision * INTERVAL '1 second') "
+            "AND e.updated_at < now() - (CAST(? AS double precision) "
+            "* INTERVAL '1 second') "
             "AND NOT EXISTS ("
             "  SELECT 1 FROM agent_approval AS a WHERE a.id = e.approval_id "
             "  AND a.status = 'in_progress' AND a.lease_until > now())",
@@ -310,7 +311,8 @@ class PostgresToolEffectRepository:
             "FROM agent_tool_effect AS e "
             "LEFT JOIN agent_approval AS a ON a.id = e.approval_id "
             "WHERE e.status = 'started' "
-            "AND e.updated_at < now() - (?::double precision * INTERVAL '1 second') "
+            "AND e.updated_at < now() - (CAST(? AS double precision) "
+            "* INTERVAL '1 second') "
             "AND (a.id IS NULL OR a.status <> 'in_progress' OR a.lease_until <= now()) "
             "ORDER BY e.updated_at",
             (max(1, int(stale_seconds)),),
