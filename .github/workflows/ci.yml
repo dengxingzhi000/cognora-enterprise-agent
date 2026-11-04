@@ -59,13 +59,13 @@ jobs:
         env:
           AGENT_TEST_PG_DSN: postgresql://postgres@127.0.0.1:5432/db_agent
         run: pytest -q -rs
-      - name: Concurrency cases must run, not skip
+      - name: Concurrency and kill/restart drills must run, not skip
         env:
           AGENT_TEST_PG_DSN: postgresql://postgres@127.0.0.1:5432/db_agent
         run: |
-          pytest -q -rs tests/test_approval_concurrency.py | tee concurrency.txt
-          if grep -q "skipped" concurrency.txt; then
-            echo "::error::concurrency cases were skipped; a DSN must be configured"
+          pytest -q -rs tests/test_approval_concurrency.py tests/test_kill_restart_drill.py | tee drills.txt
+          if grep -q "skipped" drills.txt; then
+            echo "::error::concurrency/kill-restart cases were skipped; a DSN must be configured"
             exit 1
           fi
       - name: Explain skipped integration tests

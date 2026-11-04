@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [0.5.4] — 2026-11-04
+
+Kill/restart drills are now automated in CI against a real uvicorn process and
+a real Postgres, on top of the v0.5.3 concurrency hardening.
+
+### Added
+
+- `tests/drill_app.py` — a test-only ASGI app that imports the production
+  gateway unchanged and swaps just two seams: a deterministic planner (one
+  `call_tool` to `payment.execute`, a HIGH_RISK tool that requires approval) and
+  an instrumented tool implementation that appends `invoked` / `finished` lines
+  to a counter file and can sleep on demand.
+- `tests/test_kill_restart_drill.py` — boots `uvicorn drill_app:app` as a
+  subprocess on a random free port with `AGENT_PG_DSN` pointed at the CI
+  Postgres, waits for `/health`, drives the scenario, sends `SIGKILL` to the
+  whole process group (`os.killpg`; `proc.kill()` off POSIX), restarts a brand
+  new process, and asserts what survived:
+  - **kill while `WAITING_APPROVAL`**: the `agent_paused_task` row survives,
+    resume while still pending is a 409 (reachable, never 404), then
+    approve + resume executes exactly once.
+  - **kill mid-tool-execution**: the approval is left `approved` +
+    `consumed=FALSE` — retryable, *not* the "consumed but no result" bad state;
+    the retry replays the side effect, which the counter asserts (2 invocations).
+  - **kill after approval, before resume**: the approved decision is durable,
+    resume runs once, the paused row is deleted, and a second resume is a clean
+    404 with no extra invocation.
+- The CI gate is now "Concurrency and kill/restart drills must run, not skip":
+  it runs both test files and fails the job if any case is skipped.
+
+### Not covered
+
+- The drills run against a runner-local Postgres and a single uvicorn process;
+  **VM real-environment drills and multi-instance / multi-process ownership are
+  still not exercised.**
+- `resume` still executes the tool before `consume()`, so a crash mid-tool
+  replays the side effect on retry (asserted by scenario 2). Making that
+  two-phase is an API-semantics decision and was not taken here.
+- `/chat` still has no idempotency key.
+
 ## [0.5.3] — 2026-11-04
 
 Concurrency hardening for the HITL approval store, verified against a real
