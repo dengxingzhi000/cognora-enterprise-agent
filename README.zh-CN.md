@@ -116,7 +116,9 @@ pytest -q
 | `AGENT_PORT` | `8762` | 网关端口 |
 | `AGENT_PG_DSN` | 未设置 | **唯一开关**：审批、挂起任务、Episodic 记忆、checkpoint；指向 `db_agent` |
 | `AGENT_PG_OFFLINE` | 未设置 | 无论 DSN 如何都强制 Agent 持久化与 MemoryStore 离线 |
-| `AGENT_APPROVAL_LEASE_SECONDS` | `300` | resume 原子 claim 审批后的租约（秒）；过期后下一次 resume 惰性回收 |
+| `AGENT_APPROVAL_LEASE_SECONDS` | `300` | resume 原子 claim 审批后的基础租约（秒）；执行期心跳会持续续期，因此不再需要大于最大工具时长 |
+| `AGENT_APPROVAL_HEARTBEAT_ENABLED` | `true` | 执行期租约心跳开关；`0`/`false` 关闭（演练「心跳缺席仍会过期」用） |
+| `AGENT_APPROVAL_HEARTBEAT_INTERVAL_SECONDS` | 租约 / 3 | 续期间隔覆盖值；不设置则按租约推导，非法值回落推导值 |
 | `AGENT_APPROVAL_RECLAIM_ON_RESUME` | `true` | resume 入口是否惰性回收过期的 `in_progress` claim |
 | `AGENT_TEST_PG_DSN` | 未设置 | 真实 Postgres 集成测试的 opt-in 开关；应用本身不读取 |
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | 本地确定性 embedding，无外部模型 |
@@ -141,7 +143,7 @@ pytest -q
 | 🧰 | **工具注册表** | 内置运维工具、SCM REST 工具与 MCP 共用一条分发路径 |
 | 🧩 | **MCP server** | `metrics.get`、`logs.search`、`git.diff`，MCP 形状结果；`mcp` 为可选依赖 |
 | 🛡️ | **Policy** | 读 ⇒ allow，写 ⇒ 需审批，未知 ⇒ deny；跨租户写直接拒绝 |
-| ✋ | **持久化 HITL** | 两阶段审批（原子 claim → 执行 → done/failed，租约 + 惰性回收）；挂起 `AgentState` 在 `AGENT_PG_DSN` 指向 `db_agent` 时可跨重启 |
+| ✋ | **持久化 HITL** | 两阶段审批（原子 claim → 执行期心跳续期 → done/failed，租约 + 惰性回收）；挂起 `AgentState` 在 `AGENT_PG_DSN` 指向 `db_agent` 时可跨重启 |
 | 🧠 | **记忆** | 五层记忆 + 真实 Episodic 检索（任务类型、工具、词面相似度）；排序前先做租户隔离 |
 | 📚 | **检索** | 确定性 hashing embedding + 内存余弦索引 + 词面/向量加权 rerank；pgvector 可选 |
 | 🔀 | **工作流** | 手写 durable guard（timeout / retry / idempotency / loop limit）+ 可选真 LangGraph `StateGraph` |
@@ -155,7 +157,7 @@ pytest -q
 | 状态 | 能力 | 激活条件 | 验证状态 |
 | --- | --- | --- | --- |
 | **始终可用** | 手写 runtime、Tool Registry、Policy/HITL 状态机、本地 hashing RAG、内存 Episodic、内存审批/挂起任务、内存 Tracer、fixture 场景 | 只需 `pip install -e .` | CI（单测/fixture） |
-| **条件生效** | 持久化审批 / 挂起任务 / Episodic / checkpoint | `AGENT_PG_DSN` 指向 `db_agent`（5432），并已执行 schema | CI：真实 PG 并发、租约回收与 kill/restart 演练 |
+| **条件生效** | 持久化审批 / 挂起任务 / Episodic / checkpoint | `AGENT_PG_DSN` 指向 `db_agent`（5432），并已执行 schema | CI：真实 PG 并发、租约心跳/回收与 kill/restart 演练 |
 | **条件生效** | pgvector 后端 | `RAG_PGVECTOR_ENABLED=1` + 带 `vector` 扩展的 Postgres。已验证测试实例是 `192.168.0.121:5434/db_agent_vector`（`extversion=0.8.7`）；**不要用 5433**，那是另一个项目的容器 | 真实实例已手动验证（5434，vector 0.8.7）；CI 只走内存索引 |
 | **条件生效** | MCP server | `pip install -e ".[mcp]"`；`python -m agent.mcp.server` 仅 stdio | 工具注册有 CI 单测；stdio 启动为手动验证，不是常驻 daemon |
 | **条件生效** | Prometheus `/metrics` | `pip install -e ".[observability]"` | CI 单测覆盖 200 / 503 |
@@ -266,6 +268,10 @@ cognora-enterprise-agent/
 ### 持久化 HITL 与精确匹配审批
 
 写操作不能因为用户“说了”就执行。`PolicyEngine` 对读返回 `allow`，对写返回 `need_approval`，对未知或跨租户操作返回 `deny`。状态机先原子 claim（`approved` + 未消费 → `in_progress`，带租约），再执行，成功才置 `done` + `consumed`，失败置 `failed` 并记录脱敏摘要；特权 executor 只在审批单处于 `approved`/`in_progress`、未被消费、且存储的 `tool` + `args` 与待执行动作完全匹配时才放行。`POST /approval/{id}/decide` 记录决策；`POST /chat/{task_id}/resume` 执行这一个已批准动作，被驳回则取消任务。
+
+执行期心跳每 `租约/3` 续一次 `lease_until`，所以**租约不再需要大于最大工具时长**：2 秒租约下的 5 秒工具不会被误回收。续期同样是条件更新（`status='in_progress' AND lease_until > now()`），已被回收的行不会被续命；续期影响 0 行（或数据库连续失败超过阈值）即判定租约丢失、停止心跳，resume 返回 **409 lease lost** 而不是伪造的 `done`。进程被 SIGKILL 时心跳随进程消失 → 租约自然过期 → 下一次 resume 回收，因此重放上界仍是 **1 次，不是 0 次**。
+
+已知限制（多实例）：`AGENT_APPROVAL_RECLAIM_ON_RESUME=true`（默认）时，任一实例的 resume 都可能回收另一实例的过期租约。租约本身仍然正确，但实例归属（`claimed_by`）未实现，多实例部署应先加归属校验，而不是只依赖惰性回收。
 
 配置 `AGENT_PG_DSN` 后，审批单落 `agent_approval`，完整 `AgentState` 快照（含 `AgentTask`）落 `agent_paused_task`，按 `(tenant_id, task_id)` 隔离。没有 DSN 时只在进程内；重启会丢失挂起审批，但离线测试永远不需要数据库。
 

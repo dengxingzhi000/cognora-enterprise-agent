@@ -1,6 +1,6 @@
 [project]
 name = "enterprise-agent"
-version = "0.5.5"
+version = "0.5.6"
 description = "Enterprise AI Operations Agent - durable HITL, MCP, vector RAG, optional observability, LangGraph (v0.5.1)"
 requires-python = ">=3.12"
 dependencies = [

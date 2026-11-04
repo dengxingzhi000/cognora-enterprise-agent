@@ -17,8 +17,10 @@ from observability.otel import build_otel_adapter
 from integrations.scm.client import scm_trace_id
 from security.approval import (
     ApprovalConflict,
+    approval_lease_seconds,
     build_approval_store,
     reclaim_on_resume_enabled,
+    start_lease_heartbeat,
 )
 from security.policy import PolicyEngine
 from agent.runtime.paused_tasks import build_paused_task_store
@@ -242,14 +244,17 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
         raise HTTPException(status_code=409, detail=f"approval is {item['status']}, not approved")
 
     # 两阶段第一步：原子 claim。并发 resume 只有一个进入执行，其余拿到 409；
-    # 进程崩溃后行停在 in_progress，租约到期才允许重试（最多重放一次）。
+    # 进程崩溃后行停在 in_progress，心跳停止 → 租约到期才允许重试（最多重放一次）。
+    lease = approval_lease_seconds()
     try:
-        _APPROVALS.claim(aid)
+        _APPROVALS.claim(aid, lease)
     except ApprovalConflict:
         raise HTTPException(status_code=409, detail="approval is already claimed")
 
     tool = item["tool"]
     args = item["args"]
+    # 两阶段执行期：心跳每隔 lease/3 续期一次，租约因此不再需要大于工具时长。
+    heartbeat = start_lease_heartbeat(_APPROVALS, aid, lease)
     try:
         obs = guarded_executor(
             {"action": "call_tool", "tool": tool, "args": args},
@@ -260,6 +265,15 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
         logger.exception("approved action failed")
         _mark_approval_failed(aid, "execution failed")
         raise HTTPException(status_code=502, detail="approved action failed to execute")
+    finally:
+        # 工具返回或抛异常后必须停掉续期循环，避免线程泄漏。
+        if heartbeat is not None:
+            heartbeat.stop()
+
+    if heartbeat is not None and heartbeat.lost:
+        # 租约在执行期间被回收：不再写 done/failed，避免覆盖他人的 claim。
+        logger.warning("approval %s lease was lost during execution", aid)
+        raise HTTPException(status_code=409, detail="approval lease lost during execution")
 
     # 若放行失败，guarded_executor 会写入一个新的 approval_id；此时不动原审批单。
     if state.context.get("approval_id") != aid:
@@ -272,8 +286,13 @@ def resume_chat(task_id: str, req: ResumeRequest | None = None):
         _mark_approval_failed(aid, result)
         raise HTTPException(status_code=502, detail="approved action failed to execute")
 
-    # 两阶段第二步：成功才置 done + consumed。
-    _APPROVALS.complete(aid)
+    # 两阶段第二步：成功才置 done + consumed。条件更新 0 行说明租约已被回收
+    #（心跳关闭/丢失期间发生），此时不覆盖他人的 claim。
+    try:
+        _APPROVALS.complete(aid)
+    except ValueError:
+        logger.warning("approval %s could not be completed; lease lost", aid)
+        raise HTTPException(status_code=409, detail="approval lease lost during execution")
     state.observations.append(obs)
     state.messages.append({"role": "observation", "content": str(obs)})
     for key in ("pause_reason", "approval_id", "approval_tool", "approval_args"):

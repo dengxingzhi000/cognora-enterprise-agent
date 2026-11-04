@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -13,7 +14,10 @@ import uuid
 import warnings
 from itertools import count
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_LEASE_SECONDS = 300
+DEFAULT_HEARTBEAT_MAX_FAILURES = 3
 
 
 def approval_lease_seconds() -> int:
@@ -31,6 +35,24 @@ def reclaim_on_resume_enabled() -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
+def approval_heartbeat_enabled() -> bool:
+    """执行期租约心跳开关（默认开）。关闭只用于演练「心跳缺席仍会过期」。"""
+    raw = os.environ.get("AGENT_APPROVAL_HEARTBEAT_ENABLED", "true")
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def heartbeat_interval_seconds(lease_seconds: int) -> float:
+    """续期间隔。默认取租约的 1/3；显式配置优先，非法值回落推导值。"""
+    fallback = max(0.05, float(lease_seconds) / 3.0)
+    raw = os.environ.get("AGENT_APPROVAL_HEARTBEAT_INTERVAL_SECONDS")
+    if not raw:
+        return fallback
+    try:
+        return max(0.01, float(raw))
+    except (TypeError, ValueError):
+        return fallback
+
+
 class ApprovalConflict(ValueError):
     """并发下审批状态已被其他请求改写；调用方应按 409 处理。"""
 
@@ -41,6 +63,7 @@ class ApprovalRepository:
     def approve(self, approval_id: str, approver: str) -> dict: ...
     def reject(self, approval_id: str, approver: str) -> dict: ...
     def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict: ...
+    def renew(self, approval_id: str, lease_seconds: int | None = None) -> bool: ...
     def complete(self, approval_id: str) -> dict: ...
     def fail(self, approval_id: str, last_error: str) -> dict: ...
     def reclaim_expired_claims(self) -> int: ...
@@ -91,6 +114,20 @@ class InMemoryApprovalRepository(ApprovalRepository):
             item["claimed_at"] = time.monotonic()
             item["lease_until"] = item["claimed_at"] + lease
             return item
+
+    def renew(self, approval_id: str, lease_seconds: int | None = None) -> bool:
+        """心跳续期：仅当行仍由本次 claim 持有（in_progress 且未过期）时生效。"""
+        lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+        now = time.monotonic()
+        with self._lock:
+            item = self._items.get(approval_id)
+            if item is None or item["status"] != "in_progress":
+                return False
+            until = item.get("lease_until")
+            if until is None or until <= now:
+                return False
+            item["lease_until"] = now + lease
+            return True
 
     def complete(self, approval_id: str) -> dict:
         with self._lock:
@@ -213,6 +250,19 @@ class PostgresApprovalRepository(ApprovalRepository):
         raise ApprovalConflict(
             f"approval {approval_id} is {item['status']}, not claimable")
 
+    def renew(self, approval_id: str, lease_seconds: int | None = None) -> bool:
+        """心跳续期：条件更新，0 行 = 租约已被回收/已过期，调用方必须停止续期。"""
+        lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+        updated = self._c.execute_rowcount(
+            "UPDATE agent_approval "
+            "SET lease_until = now() + (CAST(? AS INTEGER) * INTERVAL '1 second'), "
+            "updated_at = now() "
+            "WHERE id = ? AND status = 'in_progress' "
+            "AND lease_until IS NOT NULL AND lease_until > now()",
+            (lease, approval_id),
+        )
+        return bool(updated)
+
     def complete(self, approval_id: str) -> dict:
         updated = self._c.execute_rowcount(
             "UPDATE agent_approval SET consumed = TRUE, consumed_at = now(), "
@@ -277,6 +327,9 @@ class ApprovalStore:
     def claim(self, approval_id: str, lease_seconds: int | None = None) -> dict:
         return self._repo.claim(approval_id, lease_seconds)
 
+    def renew(self, approval_id: str, lease_seconds: int | None = None) -> bool:
+        return self._repo.renew(approval_id, lease_seconds)
+
     def complete(self, approval_id: str) -> dict:
         return self._repo.complete(approval_id)
 
@@ -288,6 +341,73 @@ class ApprovalStore:
 
     def list_items(self) -> list[dict]:
         return self._repo.list_items()
+
+
+class LeaseHeartbeat:
+    """执行期租约心跳：每隔 ``lease/3`` 续一次，租约不再需要大于工具时长。
+
+    续期条件更新带 ``status='in_progress' AND lease_until > now()``，所以被他人
+    回收的行不会被续命；0 行受影响即判定租约丢失（``lost=True``），由调用方决定
+    如何处置。数据库瞬时不可用只记 warning 并计数，超过阈值同样判定丢失。
+    """
+
+    def __init__(self, store, approval_id: str, lease_seconds: int,
+                 interval: float | None = None,
+                 max_failures: int = DEFAULT_HEARTBEAT_MAX_FAILURES):
+        self._store = store
+        self._id = approval_id
+        self._lease = max(1, int(lease_seconds))
+        self.interval = (heartbeat_interval_seconds(self._lease)
+                         if interval is None else max(0.01, float(interval)))
+        self.max_failures = max(1, int(max_failures))
+        self.failures = 0
+        self.lost = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> "LeaseHeartbeat":
+        self._thread = threading.Thread(
+            target=self._run, name=f"approval-heartbeat-{self._id}", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """停止续期；工具返回/抛异常后必须调用（finally），避免线程泄漏。"""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(1.0, self.interval * 2))
+        self._thread = None
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                renewed = self._store.renew(self._id, self._lease)
+            except Exception as e:  # noqa: BLE001 - 瞬时故障不断执行，只计数
+                self.failures += 1
+                logger.warning("approval heartbeat renew failed (%d/%d): %s",
+                               self.failures, self.max_failures, e)
+                if self.failures >= self.max_failures:
+                    self.lost = True
+                    logger.warning("approval %s lease lost after %d renew failures",
+                                   self._id, self.failures)
+                    return
+                continue
+            self.failures = 0
+            if not renewed:
+                self.lost = True
+                logger.warning("approval %s lease was reclaimed; heartbeat stopped",
+                               self._id)
+                return
+
+
+def start_lease_heartbeat(store, approval_id: str,
+                          lease_seconds: int | None = None) -> LeaseHeartbeat | None:
+    """claim 成功后启动心跳；配置关闭时返回 None（演练「心跳缺席」可复现）。"""
+    if not approval_heartbeat_enabled():
+        return None
+    lease = approval_lease_seconds() if lease_seconds is None else max(1, int(lease_seconds))
+    return LeaseHeartbeat(store, approval_id, lease).start()
 
 
 def build_approval_store(dsn: str | None = None, connector=None) -> ApprovalStore:

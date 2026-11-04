@@ -103,6 +103,60 @@ def test_expired_lease_is_reclaimed(store, connector):
         _cleanup(connector, approval_id=aid)
 
 
+def test_renew_extends_live_lease(store, connector):
+    """心跳持续续期：即使超过原始租约，行仍存活且回收拿到 0 条。"""
+    tenant = _tenant()
+    aid = store.request({"tenant_id": tenant, "user_id": "u1"},
+                        TOOL, {"sku": "X", "tenant_id": tenant})
+    store.approve(aid, "mgr-1")
+    try:
+        store.claim(aid, lease_seconds=1)
+        for _ in range(8):
+            assert store.renew(aid, 1) is True
+            time.sleep(0.2)  # 累计 1.6s > 1s 原始租约
+        assert store.get(aid)["status"] == "in_progress"
+        live = connector.fetch_one(
+            "SELECT (lease_until > now()) AS live FROM agent_approval WHERE id = ?",
+            (aid,))
+        assert live["live"] is True, live
+        store.complete(aid)
+    finally:
+        _cleanup(connector, approval_id=aid)
+
+
+def test_reclaimed_row_is_not_renewed(store, connector):
+    """A 的租约过期被回收后，A 的续期 UPDATE 必须 0 行，心跳立即停止。"""
+    from security.approval import LeaseHeartbeat
+
+    tenant = _tenant()
+    aid = store.request({"tenant_id": tenant, "user_id": "u1"},
+                        TOOL, {"sku": "X", "tenant_id": tenant})
+    store.approve(aid, "mgr-1")
+    try:
+        store.claim(aid, lease_seconds=1)
+        time.sleep(1.4)
+        assert store.reclaim_expired_claims() >= 1
+        assert store.get(aid)["status"] == "approved"
+
+        # 续期条件更新含 status='in_progress' AND lease_until > now()，故 0 行。
+        assert store.renew(aid, 30) is False
+
+        heartbeat = LeaseHeartbeat(store, aid, lease_seconds=1, interval=0.1).start()
+        try:
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not heartbeat.lost:
+                time.sleep(0.05)
+            assert heartbeat.lost is True
+        finally:
+            heartbeat.stop()
+
+        # 回收后可以重新 claim 执行
+        assert store.claim(aid, lease_seconds=30)["status"] == "in_progress"
+        assert store.complete(aid)["status"] == "done"
+    finally:
+        _cleanup(connector, approval_id=aid)
+
+
 def test_concurrent_approve_and_reject_one_wins(store, connector):
     """并发 approve + reject：一个生效，另一个拿到 ApprovalConflict。"""
     from security.approval import ApprovalConflict
