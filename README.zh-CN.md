@@ -121,6 +121,7 @@ pytest -q
 | `AGENT_APPROVAL_HEARTBEAT_INTERVAL_SECONDS` | 租约 / 3 | 续期间隔覆盖值；不设置则按租约推导，非法值回落推导值。启动时若 `2 * interval >= 租约` 直接失败（见下文） |
 | `AGENT_APPROVAL_RECLAIM_ON_RESUME` | `true` | resume 入口是否惰性回收过期的 `in_progress` claim |
 | `AGENT_TOOL_TIMEOUT_SECONDS` | `120` | 单次工具执行超时（秒）。SCM 写接口通常数秒返回；120 秒覆盖重试与慢查询，同时避免卡死工具永久占用 `in_progress` |
+| `AGENT_INSTANCE_ID` | `hostname:pid` | claim 写入 `claimed_by` 的实例标识；claim/续期使用它，惰性回收据此避免回收本实例未过期的租约 |
 | `AGENT_TEST_PG_DSN` | 未设置 | 真实 Postgres 集成测试的 opt-in 开关；应用本身不读取 |
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | 本地确定性 embedding，无外部模型 |
 | `RAG_PGVECTOR_ENABLED` | 未设置 | `1` 开启 pgvector（需要 `vector` 扩展与 DSN） |
@@ -165,7 +166,7 @@ pytest -q
 | **条件生效** | OTLP spans | `pip install -e ".[observability]"` + `OTEL_EXPORTER_OTLP_ENDPOINT`（gRPC 4317 / HTTP 4318）；未设置保持内存 Tracer | exporter 接线有 CI 单测；真实 collector 投递已手动验证（4317/4318，指标出口 8889）；无厂商后端 |
 | **条件生效** | 真 LangGraph / PG checkpoint | `pip install -e ".[langgraph]"`；PG checkpoint 还需 `AGENT_PG_DSN` | 装可选组时图测试在 CI 运行；PG checkpoint 为手动验证，无 DSN 时 skip |
 | **条件生效** | 真实 SCM 工具 | `SCM_GATEWAY_URL` + 认证配置；否则工具保持 mock | CI 走 mock；本仓库未验证真实 gateway |
-| **未声称** | 生产 collector/告警、OTLP 后端保留、MCP HTTP daemon；VM 真实环境演练、多实例归属、工具级幂等 | CI 演练使用 runner 本机 Postgres 与单进程有限重启，不证明跨主机归属或 exactly-once 副作用 | — |
+| **未声称** | 生产 collector/告警、OTLP 后端保留、MCP HTTP daemon；VM 真实环境演练、跨主机归属、exactly-once 副作用 | CI 演练使用 runner 本机 Postgres 与单进程有限重启；`claimed_by` 是实例归属而非分布式锁，`agent_tool_effect` 只覆盖经本框架调用的写工具 | — |
 
 **验证口径：**「CI」表示每次绿色构建都会实际执行该路径；「手动」表示只在表中实例上跑过一次，CI 不会重复。手动结果不等于 CI 保证。
 
@@ -270,15 +271,17 @@ cognora-enterprise-agent/
 
 写操作不能因为用户“说了”就执行。`PolicyEngine` 对读返回 `allow`，对写返回 `need_approval`，对未知或跨租户操作返回 `deny`。状态机先原子 claim（`approved` + 未消费 → `in_progress`，带租约），再执行，成功才置 `done` + `consumed`，失败置 `failed` 并记录脱敏摘要；特权 executor 只在审批单处于 `approved`/`in_progress`、未被消费、且存储的 `tool` + `args` 与待执行动作完全匹配时才放行。`POST /approval/{id}/decide` 记录决策；`POST /chat/{task_id}/resume` 执行这一个已批准动作，被驳回则取消任务。
 
-执行期心跳每 `租约/3` 续一次 `lease_until`，所以**租约不再需要大于最大工具时长**：2 秒租约下的 5 秒工具不会被误回收。每次 claim 还会生成新的 `claim_token UUID`，续期、`complete`、`fail` 全部带 `AND claim_token=$token`：丢失租约的旧执行者影响 **0 行**、不写任何终态，返回 **409 `approval lease lost`**，绝不会覆盖新持有者的行。续期同样是条件更新（`status='in_progress' AND lease_until > now()`），已被回收的行不会被续命；续期影响 0 行（或数据库连续失败超过阈值）即判定租约丢失、停止心跳，resume 返回 **409 lease lost** 而不是伪造的 `done`。启动时校验余量：`max_failures * interval` 必须 `< 租约`，不满足直接失败（fail-fast，不静默降级）。工具超过 `AGENT_TOOL_TIMEOUT_SECONDS` 会被取消，审批置 `failed`、`last_error` 固定为 `tool timeout`，心跳随 `finally` 停止——卡死的工具不会因为心跳续命而永远停在 `in_progress`。进程被 SIGKILL 时心跳随进程消失 → 租约自然过期 → 下一次 resume 回收，因此重放上界仍是 **1 次，不是 0 次**。
+配置 `AGENT_PG_DSN` 后，审批单落 `agent_approval`，完整 `AgentState` 快照（含 `AgentTask`）落 `agent_paused_task`，按 `(tenant_id, task_id)` 隔离。没有 DSN 时只在进程内；重启会丢失挂起审批，但离线测试永远不需要数据库。
+
+resume 是 claim-first：原子条件 `UPDATE ... WHERE status='approved' AND consumed=FALSE` 把行置为 `in_progress`，同时写入租约和**新的 `claim_token UUID`**，只有胜者执行。续期、`complete`、`fail` 全部带 `AND claim_token = $token`：丢失租约的旧执行者影响 **0 行**、不写任何终态，返回 **409 `approval lease lost`**，绝不会覆盖新持有者的行。执行期心跳每 `租约/3` 续一次 `lease_until`，所以**租约不再需要大于最大工具时长**。续期同样是条件更新（`status='in_progress' AND lease_until > now()`），已被回收的行不会被续命；续期 0 行（或数据库连续失败超过阈值）即停止心跳，resume 返回 **409 lease lost** 而不是伪造的 `done`。启动时校验余量：`max_failures * interval` 必须 `< 租约`，不满足直接失败（fail-fast，不静默降级）。工具超过 `AGENT_TOOL_TIMEOUT_SECONDS` 会被取消，审批置 `failed`、`last_error` 固定为 `tool timeout`，心跳随 `finally` 停止——卡死的工具不会因为心跳续命而永远停在 `in_progress`。进程被 SIGKILL 时心跳随进程消失 → 租约自然过期 → 下一次 resume 回收。
+
+写工具幂等落在 `agent_tool_effect`，唯一键 `(tenant_id, approval_id, tool_name, args_hash)`。工具执行前，resume 用 `INSERT ... ON CONFLICT DO NOTHING` 占位（`status=started`），只有占位成功者才真正调用工具。之后同一 approval + 同一工具 + 同一参数的尝试：看到 `succeeded` 就直接回放存储的结果引用（`sha256:` 摘要，绝不含原始载荷）而**不再执行**；看到 `started` 返回 **409 `tool execution already started`**（不并跑）；看到 `failed` 允许一次重试（`attempt=2`，第三次拒绝）。`args_hash` 是稳定序列化：递归键排序、剔除 `tenant_id`/请求与追踪 ID/时间戳等易变字段、紧凑 JSON、sha256。超时会把 effect 记为 `failed` 且带 `maybe_side_effect=true`，调用方能区分「不确定是否已生效」与「干净失败」。
 
 已知限制：
-- 重放上界：**每次崩溃最多重放 1 次**，多次崩溃可累加；不是「0 次重放」。
-- 多实例：`AGENT_APPROVAL_RECLAIM_ON_RESUME=true`（默认）时，任一实例的 resume 都可能回收另一实例的过期租约。租约本身仍然正确，但实例归属（`claimed_by`）未实现，多实例部署应先加归属校验，而不是只依赖惰性回收。
+- 已覆盖场景的重放上界：**同一 approval + 同一工具 + 同一参数**下，崩溃/重试的 resume 执行写操作 **0 次**（回放 effect 行）。这不是「任意场景零重放」：不同参数视为不同 effect，非本框架发起的工具调用不受保护，超时后被放弃的线程里工具仍可能继续跑完。
+- 多实例：`claimed_by`（来自 `AGENT_INSTANCE_ID`，缺省 `hostname:pid`）由 claim 写入、续期校验；惰性回收会跳过本实例**自己的未过期**租约。他实例真正过期的租约仍会被回收——这是预期的崩溃恢复，不是缺陷。`claimed_by` **不提供**跨主机 fencing 或 exactly-once 副作用：两个进程共用同一 `AGENT_INSTANCE_ID`、宿主机暂停、或工具已经产生副作用的情况仍不受保护。多实例部署应给每个实例不同 ID，并把这里理解为 at-most-once **尝试**，而不是分布式锁。
 - 墙钟测试：心跳/回收用例（`tests/test_approval_heartbeat.py`、`test_approval_concurrency.py`）依赖真实时间（sleep、租约快进）。它们是回归保护，**不是逻辑不变量**，CI 机器负载高时可能抖动。
-- `execute_with_timeout` 在子线程里执行工具且无法强杀：超时后那个被放弃的线程仍可能在后台跑完（没有幂等键的工具仍有残余风险）。
-
-配置 `AGENT_PG_DSN` 后，审批单落 `agent_approval`，完整 `AgentState` 快照（含 `AgentTask`）落 `agent_paused_task`，按 `(tenant_id, task_id)` 隔离。没有 DSN 时只在进程内；重启会丢失挂起审批，但离线测试永远不需要数据库。
+- `execute_with_timeout` 在子线程里执行工具且无法强杀：超时后那个被放弃的线程仍可能在后台跑完。effect 行会记 `maybe_side_effect=true`，但该标志是信息，不是回滚。
 
 ### Episodic 记忆
 

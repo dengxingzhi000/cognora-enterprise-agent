@@ -8,6 +8,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [0.5.8] — 2026-11-04
+
+Write-tool idempotency plus instance attribution: the covered crash replay
+bound goes from "at most one" to **zero**, and lazy reclaim stops an instance
+from reclaiming its own live lease.
+
+### Added
+
+- `agent_tool_effect`, unique on `(tenant_id, approval_id, tool_name, args_hash)`:
+  `status` (`started` / `succeeded` / `failed`), `result_ref`, `attempt`,
+  `maybe_side_effect`, `created_at`, `updated_at`. Resume reserves the row with
+  `INSERT ... ON CONFLICT DO NOTHING` (`status='started'`) and only the
+  reservation winner executes the tool:
+  - `succeeded` → replay the stored `sha256:` result reference, **do not execute**;
+  - `started` → **409 `tool execution already started`** (no parallel run);
+  - `failed` → one retry (`attempt=2`); the third attempt is refused.
+- `args_hash` is a stable serialization: recursive key sorting, volatile fields
+  (`tenant_id`, request/trace ids, timestamps) removed, compact JSON, sha256.
+  `result_ref` is a digest, never the raw tool payload.
+- Tool timeout marks the effect `failed` with `maybe_side_effect=true`, so an
+  ambiguous failure is distinguishable from a clean one.
+- `agent_approval.claimed_by TEXT` (idempotent column + `ADD COLUMN IF NOT
+  EXISTS`). Claim writes it, renew verifies it. `AGENT_INSTANCE_ID` supplies the
+  value (default `hostname:pid`). Lazy reclaim skips the caller's **own live**
+  lease via `AND NOT (claimed_by = $me AND lease_until > now())`; other
+  instances' genuinely expired leases are still reclaimed. A conflict on the
+  effect row releases the claim so the caller does not wait out the lease.
+- `release()` returns a freshly claimed but unexecuted row to `approved` and
+  clears `claimed_at` / `lease_until` / `claim_token` / `claimed_by`.
+
+### Changed
+
+- `pytest` gate adds `tests/test_tool_effect.py` next to the heartbeat,
+  concurrency and kill/restart drills; "skipped is failure" still applies.
+
+### Testing
+
+- Same approval + same tool + same args retried after a simulated crash:
+  second resume does **not** invoke the tool (`invoked == 1`) and returns
+  `cached=true`, `executed=false`.
+- A `started` placeholder left by a crash: second resume gets **409**, no
+  parallel execution, row returned to `approved`.
+- `failed` allows exactly one retry (`attempt=2`), the third is refused
+  (`retry budget exhausted`).
+- Different args hash to a different effect and each executes.
+- `claimed_by`: own live lease is not reclaimed; another instance's expired
+  lease is; own expired lease still is.
+- Postgres repository verified for replay, retry and conflict.
+- v0.5.7's 27 gate cases stay green; `invoked` assertions unchanged.
+
+### Known limitations
+
+- Zero replay applies to the **same approval + same tool + same args** only.
+  Different args are a different effect, tools invoked outside this framework
+  are unprotected, and a tool still running in an abandoned worker thread after
+  a timeout is not stopped.
+- `claimed_by` is instance attribution, **not** a distributed lock or cross-host
+  fencing; two processes sharing `AGENT_INSTANCE_ID` or a paused host are
+  unprotected.
+- Heartbeat/reclaim tests still depend on wall-clock time.
+
 ## [0.5.7] — 2026-11-04
 
 The heartbeat's companion fixes: a claimant identity, a tool-level deadline, a

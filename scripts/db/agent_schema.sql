@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS agent_approval (
     claimed_at TIMESTAMPTZ,
     lease_until TIMESTAMPTZ,
     claim_token UUID,
+    claimed_by TEXT,
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -46,6 +47,26 @@ ALTER TABLE agent_approval
 
 ALTER TABLE agent_approval
     ADD COLUMN IF NOT EXISTS claim_token UUID;
+
+ALTER TABLE agent_approval
+    ADD COLUMN IF NOT EXISTS claimed_by TEXT;
+
+CREATE TABLE IF NOT EXISTS agent_tool_effect (
+    tenant_id TEXT NOT NULL DEFAULT 'default',
+    approval_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    args_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    result_ref TEXT,
+    maybe_side_effect BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, approval_id, tool_name, args_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_tool_effect_approval
+    ON agent_tool_effect(approval_id);
 
 ALTER TABLE agent_approval
     ADD COLUMN IF NOT EXISTS last_error TEXT;

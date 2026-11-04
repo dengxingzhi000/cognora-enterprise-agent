@@ -271,6 +271,9 @@ def test_api_tool_timeout_marks_failed_and_stops_heartbeat(monkeypatch):
     store = _store()
     monkeypatch.setattr(main, "_APPROVALS", store)
     monkeypatch.setattr(main, "_PAUSED_TASKS", PausedTaskStore())
+    from security.tool_effect import InMemoryToolEffectRepository, ToolEffectStore
+    effects = ToolEffectStore(InMemoryToolEffectRepository())
+    monkeypatch.setattr(main, "_TOOL_EFFECTS", effects)
 
     def planner(state):
         if state.observations:
@@ -309,6 +312,13 @@ def test_api_tool_timeout_marks_failed_and_stops_heartbeat(monkeypatch):
         assert row["status"] != "in_progress"
         assert row.get("consumed") is False
         assert row["last_error"] == "tool timeout", row
+
+        # effect 被标为 failed，且带「可能已产生副作用」标志（线程无法强杀）。
+        effect_rows = effects.list_items()
+        assert len(effect_rows) == 1, effect_rows
+        assert effect_rows[0]["status"] == "failed", effect_rows
+        assert effect_rows[0]["maybe_side_effect"] is True, effect_rows
+        assert effect_rows[0]["attempt"] == 1, effect_rows
 
         deadline = time.time() + 2.0
         while time.time() < deadline:
