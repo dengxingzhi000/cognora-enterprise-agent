@@ -116,7 +116,9 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | `AGENT_PORT` | `8762` | Gateway port |
 | `AGENT_PG_DSN` | unset | **The only switch** for approvals, paused tasks, episodic memory, and checkpoints; point it at `db_agent` |
 | `AGENT_PG_OFFLINE` | unset | Force agent persistence and the memory store offline regardless of DSN |
-| `AGENT_APPROVAL_LEASE_SECONDS` | `300` | Lease held by the resume request that atomically claimed an approval; expired claims are reclaimed on the next resume |
+| `AGENT_APPROVAL_LEASE_SECONDS` | `300` | Base lease held by the resume request that atomically claimed an approval; it is extended while the tool runs, so it does not need to exceed the longest tool duration |
+| `AGENT_APPROVAL_HEARTBEAT_ENABLED` | `true` | Execution-time lease heartbeat; `0`/`false` disables it (used by the drill that proves a heartbeat-less lease still expires) |
+| `AGENT_APPROVAL_HEARTBEAT_INTERVAL_SECONDS` | lease / 3 | Renewal interval override; unset derives it from the lease, invalid values fall back to the derived value |
 | `AGENT_APPROVAL_RECLAIM_ON_RESUME` | `true` | Lazily reclaim expired `in_progress` claims at the resume entry point |
 | `AGENT_TEST_PG_DSN` | unset | Opt-in trigger for real-Postgres integration tests; never read by the application |
 | `RAG_EMBEDDING_PROVIDER` | `hashing` | Local deterministic embedding; no external model required |
@@ -141,7 +143,7 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | 🧰 | **Tool registry** | One dispatch path for built-in ops tools, SCM REST tools, and MCP |
 | 🧩 | **MCP server** | `metrics.get`, `logs.search`, `git.diff` exposed with MCP-shaped results; `mcp` is optional |
 | 🛡️ | **Policy** | Read ⇒ allow, write ⇒ approval, unknown ⇒ deny; cross-tenant writes are rejected |
-| ✋ | **Durable HITL** | Claim-then-execute approvals (atomic claim + lease + lazy reclaim) and paused `AgentState` survive a restart when `AGENT_PG_DSN` points at `db_agent` |
+| ✋ | **Durable HITL** | Claim-then-execute approvals (atomic claim + heartbeat-renewed lease + lazy reclaim) and paused `AgentState` survive a restart when `AGENT_PG_DSN` points at `db_agent` |
 | 🧠 | **Memory** | Five layers plus real episodic recall (task type, tools, lexical similarity); tenant isolation before ranking |
 | 📚 | **Retrieval** | Deterministic hashing embeddings, in-memory cosine index, weighted lexical/vector rerank; pgvector is opt-in |
 | 🔀 | **Workflow** | Hand-rolled durable guards (timeout / retry / idempotency / loop limit) and an optional real LangGraph `StateGraph` |
@@ -155,7 +157,7 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | Status | Capability | What unlocks it | Verification |
 | --- | --- | --- | --- |
 | **Always on** | Hand-written runtime, Tool Registry, Policy/HITL transitions, local hashing RAG, in-memory episodic memory, in-memory approvals/paused tasks, in-memory Tracer, fixture scenarios | `pip install -e .` only | CI (unit/fixture) |
-| **Conditional** | Durable approvals / paused tasks / episodic / checkpoints | `AGENT_PG_DSN` pointing at `db_agent` (5432), schema already applied | CI: real-PG concurrency, lease reclaim and kill/restart drills |
+| **Conditional** | Durable approvals / paused tasks / episodic / checkpoints | `AGENT_PG_DSN` pointing at `db_agent` (5432), schema already applied | CI: real-PG concurrency, lease heartbeat/reclaim and kill/restart drills |
 | **Conditional** | pgvector backend | `RAG_PGVECTOR_ENABLED=1` + a Postgres with the `vector` extension. The verified test instance is `192.168.0.121:5434/db_agent_vector` (`extversion=0.8.7`); **do not use 5433**, which belongs to another project | Real instance verified manually (5434, vector 0.8.7); CI exercise uses the in-memory index only |
 | **Conditional** | MCP server | `pip install -e ".[mcp]"`; `python -m agent.mcp.server` runs stdio only | Tool registration is unit-tested in CI; the stdio launch is manual and is not a deployed daemon |
 | **Conditional** | Prometheus `/metrics` | `pip install -e ".[observability]"` | CI unit tests cover the 200 and 503 responses |
@@ -270,6 +272,10 @@ cognora-enterprise-agent/
 Write tools cannot execute just because a user asked. `PolicyEngine` returns `allow` for reads, `need_approval` for writes, and `deny` for unknown or cross-tenant actions. The privileged executor only proceeds when an approval is approved, unconsumed, and its stored `tool` + `args` exactly match the pending action. `POST /approval/{id}/decide` records the decision; `POST /chat/{task_id}/resume` executes the one approved action or cancels the task.
 
 With `AGENT_PG_DSN`, approvals live in `agent_approval` and the whole `AgentState` snapshot (including `AgentTask`) lives in `agent_paused_task`, keyed by `(tenant_id, task_id)`. Without a DSN they stay in process memory; a restart loses pending approvals, but the offline suite never needs a database.
+
+Resume is claim-first: an atomic conditional `UPDATE ... WHERE status='approved' AND consumed=FALSE` moves the row to `in_progress` with a lease, and only the winner executes. While the tool runs, a background heartbeat renews `lease_until` every `lease/3`, so **the lease no longer has to exceed the longest tool runtime** — a 5 s tool under a 2 s lease stays claimed. The heartbeat is conditional too (`status='in_progress' AND lease_until > now()`), so a row that was already reclaimed is never renewed; a 0-row renew (or repeated database errors past the failure threshold) stops the loop and the response becomes **409 lease lost** instead of a misleading `done`. If the process is SIGKILLed the heartbeat dies with it, the lease lapses, and the next resume reclaims the row — so replay stays bounded at one, never zero.
+
+Known limitation (multi-instance): with `AGENT_APPROVAL_RECLAIM_ON_RESUME=true` (the default), any instance's resume may reclaim another instance's expired lease. That is harmless for correctness of the lease itself, but instance ownership (`claimed_by`) is not implemented, so a multi-instance deployment should first add an ownership check rather than rely on the lazy reclaim alone.
 
 ### Episodic memory
 

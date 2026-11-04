@@ -8,6 +8,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Version numbers are cut from the roadmap, not derived automatically, so
 0.1.0 → 0.2.0 is not "one more release" — read the entries.
 
+## [0.5.6] — 2026-11-04
+
+Execution-time lease heartbeat. The v0.5.5 design only worked if the lease
+exceeded the longest tool runtime; the lease is now renewed while the tool runs,
+so that assumption is gone.
+
+### Changed
+
+- `LeaseHeartbeat` (background daemon thread, same sync stack as the FastAPI
+  endpoints) starts right after a successful claim and is stopped in a
+  `finally` after the tool returns or raises.
+- Renewal is a conditional update:
+  `UPDATE ... SET lease_until = now() + N WHERE id=? AND status='in_progress'
+  AND lease_until > now()`. **0 rows** means the row was reclaimed elsewhere:
+  the loop stops immediately and, after the tool finishes, the response is
+  **409 `approval lease lost during execution`** instead of `done`/`failed`
+  (writing either would overwrite another claimant's row).
+- Transient database errors on renew are logged as warnings and counted; the
+  loop keeps going until `AGENT_APPROVAL_HEARTBEAT_MAX_FAILURES` (module
+  constant, default 3) consecutive failures, then declares the lease lost.
+- `ApprovalRepository` gains `renew(approval_id, lease_seconds)` returning
+  `bool` (Postgres: `rowcount > 0`; InMemory: status + live-lease check).
+
+### Configuration
+
+- `AGENT_APPROVAL_HEARTBEAT_ENABLED` (default `true`) — turning it off is the
+  drill that proves a heartbeat-less lease still expires.
+- `AGENT_APPROVAL_HEARTBEAT_INTERVAL_SECONDS` (default lease / 3; invalid
+  values fall back to the derived value).
+- Written to `.env.example` and both READMEs, including the multi-instance
+  limitation (`claimed_by` / instance ownership is not implemented; with
+  `AGENT_APPROVAL_RECLAIM_ON_RESUME=true` any instance may reclaim another
+  instance's expired lease).
+
+### Testing
+
+CI gate (`Concurrency and kill/restart drills must run, not skip`), real
+Postgres and real uvicorn, no skips:
+
+- A 5 s tool under a 2 s lease is **not** reclaimed while running
+  (`reclaim_expired_claims() == 0`), finishes `done`, `invoked=1`.
+- With the heartbeat disabled the lease expires mid-run: reclaim succeeds,
+  `complete` affects 0 rows, the first resume returns 409, and exactly one
+  replay is allowed afterwards (`invoked=2`).
+- A reclaimed row is never renewed (`renew()` returns `False`, heartbeat
+  `lost=True`).
+- 20 consecutive resumes (10 success + 10 failure) leave no heartbeat threads;
+  thread count returns to the measured baseline.
+- v0.5.5's 9 cases stay green; replay bound is still **≤ 1, not 0**.
+
+### Not covered
+
+- VM real-environment drills and multi-instance ownership (unchanged from
+  0.5.5).
+- Tool-level idempotency keys / an execution-result table — still the only way
+  to get zero replay.
+- `/chat` idempotency key (still not approved).
+
 ## [0.5.5] — 2026-11-04
 
 Two-phase resume: **claim → execute → done/failed**, with a lease and lazy

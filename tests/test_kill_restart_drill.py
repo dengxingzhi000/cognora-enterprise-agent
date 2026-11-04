@@ -47,11 +47,12 @@ class UvicornProc:
     """A real ``uvicorn`` subprocess we can SIGKILL and start again."""
 
     def __init__(self, counter_path: str, sleep_seconds: float, *, fail: bool = False,
-                 lease_seconds: int = LEASE_SECONDS):
+                 lease_seconds: int = LEASE_SECONDS, heartbeat: bool = True):
         self.counter = counter_path
         self.sleep = sleep_seconds
         self.fail = fail
         self.lease_seconds = lease_seconds
+        self.heartbeat = heartbeat
         self.proc = None
         self.port = None
 
@@ -63,6 +64,7 @@ class UvicornProc:
         env["AGENT_DRILL_SLEEP"] = str(self.sleep)
         env["AGENT_DRILL_FAIL"] = "1" if self.fail else "0"
         env["AGENT_APPROVAL_LEASE_SECONDS"] = str(self.lease_seconds)
+        env["AGENT_APPROVAL_HEARTBEAT_ENABLED"] = "1" if self.heartbeat else "0"
         env.pop("AGENT_PG_OFFLINE", None)
         env.pop("PG_OFFLINE", None)
         cmd = [
@@ -185,6 +187,13 @@ def _approval_row(db, aid: str):
         "(lease_until IS NOT NULL AND lease_until > now()) AS lease_live "
         "FROM agent_approval WHERE id = ?", (aid,)
     )
+
+
+def _repo(db):
+    """测试进程侧用一个仓储实例调用 reclaim（与 uvicorn 进程走同一张表）。"""
+    from security.approval import ApprovalStore, PostgresApprovalRepository
+
+    return ApprovalStore(PostgresApprovalRepository(db))
 
 
 def _cleanup(db, tenant: str, task_id: str | None = None, aid: str | None = None) -> None:
@@ -448,3 +457,100 @@ def test_kill_after_approval_resume_runs_once(db, tmp_path):
     finally:
         app.stop()
         _cleanup(db, tenant, task_id, aid)
+
+
+# --- case 5: long tool run must not fall into the reclaim window ------------
+
+def test_long_tool_run_survives_reclaim_window(db, tmp_path):
+    """工具运行 5s > 2s 租约：心跳续期期间外部 reclaim 必须回收 0 条。
+
+    这是 v0.5.5「租约必须大于最大工具时长」这一脆弱假设的反证：执行期心跳
+    一旦真的在跑，长任务就不会在运行中被误回收。
+    """
+    tenant = _tenant()
+    counter = str(tmp_path / "counter.txt")
+    app = UvicornProc(counter, 5.0, lease_seconds=2).start()
+    task_id = aid = None
+    try:
+        task_id, aid = _pause_for_approval(app, tenant)
+        status, body = _approve(app, aid, tenant)
+        assert status == 200 and body["status"] == "approved", body
+
+        results: list[tuple[int, dict]] = []
+
+        def _resume():
+            results.append(_post(app.base + f"/chat/{task_id}/resume",
+                                 {"tenant_id": tenant}))
+
+        worker = threading.Thread(target=_resume, daemon=True)
+        worker.start()
+        assert _wait_for_line(counter, "invoked", timeout=10), "tool never started"
+
+        # 超过一个完整租约（2s）后从另一个调用触发回收。
+        time.sleep(2.6)
+        reclaimed = _repo(db).reclaim_expired_claims()
+        assert reclaimed == 0, f"live heartbeat should keep lease out of reclaim: {reclaimed}"
+        assert _approval_row(db, aid)["status"] == "in_progress"
+
+        worker.join(timeout=20)
+        status, body = results[0]
+        assert status == 200, body
+        assert body["status"] == "done" and body["executed"] is True, body
+
+        lines = _counter_lines(counter)
+        assert lines.count("invoked") == 1, lines
+        assert lines.count("finished") == 1, lines
+        assert _approval_row(db, aid)["consumed"] is True
+        assert _paused_row(db, tenant, task_id) is None
+    finally:
+        app.stop()
+        _cleanup(db, tenant, task_id, aid)
+
+
+# --- case 6: without the heartbeat the lease still expires ------------------
+
+def test_without_heartbeat_lease_expires_mid_run(db, tmp_path):
+    """心跳关闭时租约照常过期：运行中被回收，complete 条件更新 0 行 → 409。"""
+    tenant = _tenant()
+    counter = str(tmp_path / "counter.txt")
+    app = UvicornProc(counter, 3.0, lease_seconds=2, heartbeat=False).start()
+    task_id = aid = None
+    try:
+        task_id, aid = _pause_for_approval(app, tenant)
+        status, body = _approve(app, aid, tenant)
+        assert status == 200 and body["status"] == "approved", body
+
+        results: list[tuple[int, dict]] = []
+
+        def _resume():
+            results.append(_post(app.base + f"/chat/{task_id}/resume",
+                                 {"tenant_id": tenant}))
+
+        worker = threading.Thread(target=_resume, daemon=True)
+        worker.start()
+        assert _wait_for_line(counter, "invoked", timeout=10), "tool never started"
+
+        time.sleep(2.6)
+        reclaimed = _repo(db).reclaim_expired_claims()
+        assert reclaimed >= 1, reclaimed
+        assert _approval_row(db, aid)["status"] == "approved"
+
+        worker.join(timeout=20)
+        status, body = results[0]
+        assert status == 409, body
+        assert body["detail"] == "approval lease lost during execution", body
+        assert _approval_row(db, aid)["consumed"] is False
+
+        # 回收后可重试：这次没有心跳干扰，正常 done。
+        status, body = _post(app.base + f"/chat/{task_id}/resume", {"tenant_id": tenant})
+        assert status == 200, body
+        assert body["status"] == "done" and body["executed"] is True, body
+
+        lines = _counter_lines(counter)
+        assert lines.count("invoked") == 2, lines  # 原始执行 + 1 次重放
+        assert lines.count("finished") == 2, lines
+        assert _approval_row(db, aid)["consumed"] is True
+    finally:
+        app.stop()
+        _cleanup(db, tenant, task_id, aid)
+
