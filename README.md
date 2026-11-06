@@ -9,7 +9,7 @@
 **One FastAPI gateway. A hand-written Planner/Executor loop. A fully offline path with no cloud account, no paid dependency, and no credentials.**
 
 [![Build](https://img.shields.io/github/actions/workflow/status/dengxingzhi000/cognora-enterprise-agent/ci.yml?branch=master&style=flat-square&logo=github&label=build)](https://github.com/dengxingzhi000/cognora-enterprise-agent/actions)
-[![Release](https://img.shields.io/github/v/release/dengxingzhi000/cognora-enterprise-agent?style=flat-square&label=v0.5.1)](https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.5.1)
+[![Release](https://img.shields.io/github/v/release/dengxingzhi000/cognora-enterprise-agent?style=flat-square&label=v0.5.9)](https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.5.9)
 [![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white&style=flat-square)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](./LICENSE)
 
@@ -109,8 +109,8 @@ Every value has a working offline default. Secrets belong in the environment, ne
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible endpoint |
 | `DEEPSEEK_MODEL` | `deepseek-chat` | Model id, also the pricing key for cost accounting |
 | `SCM_GATEWAY_URL` | unset | **Unset ⇒ every `scm.*` tool is a mock.** Set it to use real REST calls |
-| `SCM_AUTH_URL` | `http://localhost:8106` | scm-platform auth service |
-| `SCM_USERNAME` / `SCM_PASSWORD` | empty | scm-platform credentials |
+| `SCM_AUTH_URL` | `http://localhost:8106` | cognora-aura-platform auth service |
+| `SCM_USERNAME` / `SCM_PASSWORD` | empty | cognora-aura-platform credentials |
 | `SCM_TENANT_MAP` | `{"t1":"tenant_001"}` | Maps the agent's `tenant_id` onto SCM's `tenant` parameter |
 | `SCM_TIMEOUT_SECONDS` | `5` | Per-request timeout |
 | `AGENT_PORT` | `8762` | Gateway port |
@@ -335,7 +335,7 @@ If `psql` is unavailable, the same DDL can be executed with any Postgres client 
 
 `.github/workflows/ci.yml` runs a Python **3.12 / 3.13** matrix on `master`, installs with `pip install -e .`, and runs `pytest -q -rs`. It cancels superseded runs and uses `permissions: contents: read`. CI intentionally has no `AGENT_TEST_PG_DSN`, `DEEPSEEK_API_KEY`, or `SCM_GATEWAY_URL`, so the Postgres/pgvector integration tests and optional-dependency probes skip by design; the offline suite must stay green.
 
-`master` is protected: pull request required, force pushes and branch deletions disabled, no required review count. `v0.5.1` is an annotated tag; releases are created from tags.
+`master` is protected: pull request required, force pushes and branch deletions disabled, no required review count. `v0.5.9` is an annotated tag; releases are created from tags.
 
 ### Testing
 
@@ -412,7 +412,7 @@ Report vulnerabilities through [SECURITY.md](./SECURITY.md).
 
 ## Related projects
 
-- **[scm-platform](https://github.com/dengxingzhi000/scm-platform)** — the Java/Spring Cloud supply-chain platform whose tools and auth this agent can call when `SCM_GATEWAY_URL` is configured.
+- **[cognora-aura-platform](https://github.com/dengxingzhi000/cognora-aura-platform)** — the Java/Spring Cloud supply-chain platform whose tools and auth this agent can call when `SCM_GATEWAY_URL` is configured.
 - **[enterprise-agent](https://github.com/dengxingzhi000/enterprise-agent)** — the original repository for this agent's early history.
 
 ## Contributing

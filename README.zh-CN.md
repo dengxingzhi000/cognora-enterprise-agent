@@ -9,7 +9,7 @@
 **一个 FastAPI 网关。手写 Planner/Executor 循环。无需云账号、无需付费依赖、无需任何凭据即可跑通离线路径。**
 
 [![Build](https://img.shields.io/github/actions/workflow/status/dengxingzhi000/cognora-enterprise-agent/ci.yml?branch=master&style=flat-square&logo=github&label=build)](https://github.com/dengxingzhi000/cognora-enterprise-agent/actions)
-[![Release](https://img.shields.io/github/v/release/dengxingzhi000/cognora-enterprise-agent?style=flat-square&label=v0.5.1)](https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.5.1)
+[![Release](https://img.shields.io/github/v/release/dengxingzhi000/cognora-enterprise-agent?style=flat-square&label=v0.5.9)](https://github.com/dengxingzhi000/cognora-enterprise-agent/releases/tag/v0.5.9)
 [![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white&style=flat-square)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](./LICENSE)
 
@@ -109,8 +109,8 @@ pytest -q
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI 兼容端点 |
 | `DEEPSEEK_MODEL` | `deepseek-chat` | 模型 id，也是成本计价的 key |
 | `SCM_GATEWAY_URL` | 未设置 | **未设置 ⇒ 所有 `scm.*` 工具走 mock。** 设置后才走真实 REST |
-| `SCM_AUTH_URL` | `http://localhost:8106` | scm-platform auth 服务 |
-| `SCM_USERNAME` / `SCM_PASSWORD` | 空 | scm-platform 凭据 |
+| `SCM_AUTH_URL` | `http://localhost:8106` | cognora-aura-platform auth 服务 |
+| `SCM_USERNAME` / `SCM_PASSWORD` | 空 | cognora-aura-platform 凭据 |
 | `SCM_TENANT_MAP` | `{"t1":"tenant_001"}` | 把 Agent 的 `tenant_id` 映射到 SCM 的 `tenant` 参数 |
 | `SCM_TIMEOUT_SECONDS` | `5` | 单请求超时 |
 | `AGENT_PORT` | `8762` | 网关端口 |
@@ -333,7 +333,7 @@ psql "$AGENT_PG_DSN" -f scripts/db/agent_schema.sql
 
 `.github/workflows/ci.yml` 在 `master` 上跑 Python **3.12 / 3.13** 矩阵，`pip install -e .` 后执行 `pytest -q -rs`；并发取消重复运行，权限最小化为 `contents: read`。CI 刻意不配置 `AGENT_TEST_PG_DSN`、`DEEPSEEK_API_KEY` 或 `SCM_GATEWAY_URL`，所以 Postgres/pgvector 集成测试与可选依赖探测按设计 skip；离线套件必须全绿。
 
-`master` 已启用 branch protection：要求 PR、禁止强推、禁止删除分支，不强制 review 数。`v0.5.1` 是附注 tag，Release 从 tag 创建。
+`master` 已启用 branch protection：要求 PR、禁止强推、禁止删除分支，不强制 review 数。`v0.5.9` 是附注 tag，Release 从 tag 创建。
 
 ### 测试
 
@@ -410,7 +410,7 @@ pytest -q
 
 ## 相关项目
 
-- **[scm-platform](https://github.com/dengxingzhi000/scm-platform)** — 本 Agent 在配置 `SCM_GATEWAY_URL` 后可调用的 Java/Spring Cloud 供应链平台。
+- **[cognora-aura-platform](https://github.com/dengxingzhi000/cognora-aura-platform)** — 本 Agent 在配置 `SCM_GATEWAY_URL` 后可调用的 Java/Spring Cloud 供应链平台。
 - **[enterprise-agent](https://github.com/dengxingzhi000/enterprise-agent)** — 本 Agent 早期历史的原始仓库。
 
 ## 贡献
