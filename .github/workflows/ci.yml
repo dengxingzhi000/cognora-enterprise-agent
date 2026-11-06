@@ -63,6 +63,7 @@ jobs:
         env:
           AGENT_TEST_PG_DSN: postgresql://postgres@127.0.0.1:5432/db_agent
         run: |
+          set -o pipefail
           pytest -q -rs tests/test_tool_effect.py tests/test_approval_heartbeat.py tests/test_approval_concurrency.py tests/test_kill_restart_drill.py | tee drills.txt
           if grep -q "skipped" drills.txt; then
             echo "::error::concurrency/kill-restart cases were skipped; a DSN must be configured"
