@@ -28,7 +28,7 @@ observability = [
   "opentelemetry-exporter-otlp>=1.45.2",
 ]
 langgraph = [
-  "langgraph>=1.2.19",
+  "langgraph>=1.2.20",
   "langgraph-checkpoint-postgres>=3.2.0",
 ]
 cache = ["redis>=8.1.0"]
@@ -39,7 +39,7 @@ all = [
   "opentelemetry-api>=1.45.2",
   "opentelemetry-sdk>=1.45.2",
   "opentelemetry-exporter-otlp>=1.45.2",
-  "langgraph>=1.2.19",
+  "langgraph>=1.2.20",
   "langgraph-checkpoint-postgres>=3.2.0",
   "redis>=8.1.0",
   "tiktoken>=0.14.0",
