@@ -13,7 +13,7 @@ dependencies = [
   "pytest>=9.2.0",
   "pytest-asyncio>=1.4.1.post1",
   "sqlalchemy>=2.1.6",
-  "psycopg[binary]>=3.3.7",
+  "psycopg[binary]>=3.3.8",
 ]
 
 # Optional deps live in [project.optional-dependencies] below.
