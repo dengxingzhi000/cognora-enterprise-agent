@@ -1,7 +1,7 @@
 """Stage4 RED: 五层记忆 = Conversation/Task/User/Org/Episodic，先内存版。"""
 from agent.memory.store import MemoryStore
-from agent.runtime.state import AgentState
 from agent.runtime.loop import run
+from agent.runtime.state import AgentState
 
 
 def test_conversation_rolling_window():

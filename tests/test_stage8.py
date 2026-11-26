@@ -1,7 +1,7 @@
 """Stage8 RED: 自研Workflow == LangGraph语义；三场景复用同一套件。"""
 from workflow.graph import run_expense_workflow
 from workflow.graph_lang import build_expense_graph
-from workflow.scenarios import review_contract, analyze_sales
+from workflow.scenarios import analyze_sales, review_contract
 
 
 def test_langgraph_parity_with_handrolled():
@@ -31,4 +31,4 @@ def test_contract_small_clean_auto_passes():
 def test_sales_analysis_combines_tools():
     out = analyze_sales(question="这个月销售额为什么下降")
     assert "报告" in out["report"] or "下降" in out["report"]
-    assert "metrics.get" in out["trace"] or "db.query" in out["trace"]
+    assert any(item.startswith(("metrics.get", "db.query")) for item in out["trace"])

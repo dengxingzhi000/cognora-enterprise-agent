@@ -1,4 +1,5 @@
-"""agent/context/counter.py: 精确优先，启发兜底，保证离线不断。"""
+"""agent/context/counter.py: 默认启发计数，显式 opt-in tiktoken。"""
+import os
 import warnings
 
 
@@ -22,15 +23,17 @@ class TiktokenCounter(BaseCounter):
             import tiktoken
             self._enc = tiktoken.get_encoding(encoding_name)
         except Exception as e:  # noqa: BLE001 - 缺包或BPE下不到都转统一异常
-            raise EncodingUnavailable(str(e))
+            raise EncodingUnavailable(str(e)) from e
 
     def count(self, text: str) -> int:
         return max(1, len(self._enc.encode(text)))
 
 
 def get_counter() -> BaseCounter:
+    if os.getenv("AGENT_TOKEN_COUNTER", "heuristic") != "tiktoken":
+        return HeuristicCounter()
     try:
         return TiktokenCounter()
     except EncodingUnavailable as e:
-        warnings.warn(f"tiktoken unavailable, fallback heuristic: {e}")
+        warnings.warn(f"tiktoken unavailable, fallback heuristic: {e}", stacklevel=2)
         return HeuristicCounter()

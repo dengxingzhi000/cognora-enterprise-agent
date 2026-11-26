@@ -1,6 +1,6 @@
 """Stage7 RED: Trace必须完整，Eval必须能量化。"""
-from observability.tracing import Tracer
 from evaluation.evaluator import evaluate_expense_cases
+from observability.tracing import Tracer
 
 
 def test_tracer_records_full_chain_in_order():

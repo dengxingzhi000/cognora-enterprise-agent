@@ -5,7 +5,8 @@
 
 - ``succeeded`` → 返回缓存引用，**不再执行**
 - ``started`` → 有执行在进行/已崩溃，返回冲突（绝不并跑）
-- ``failed`` → 允许一次重试（attempt=2），第三次拒绝
+- ``failed`` → 仅当可确认没有副作用时允许一次重试（attempt=2）；结果不明确时
+  返回 ``manual reconciliation required``，禁止自动重放
 
 ``args_hash`` 用稳定序列化：递归按 key 排序、去掉租约/时间等易变字段，因此
 同一动作的不同请求体顺序不会产生不同 effect。``result_ref`` 只存摘要，不存
@@ -23,9 +24,10 @@ from infrastructure.pg.connector import get_agent_connector
 
 MAX_TOOL_EFFECT_ATTEMPTS = 2
 STALE_STARTED_ERROR = "stale started effect reclaimed"
+MANUAL_RECONCILIATION_ERROR = "manual reconciliation required"
 
 
-def tool_effect_stale_seconds() -> int:
+def tool_effect_stale_seconds() -> float:
     """``started`` 占位的过期窗口。
 
     默认 = 工具超时（``AGENT_TOOL_TIMEOUT_SECONDS``，默认 120s）+ 一个审批租约
@@ -126,6 +128,10 @@ class InMemoryToolEffectRepository:
                 return {"decision": CONFLICT, "attempt": row["attempt"], "status": "started",
                         "result_ref": None, "maybe_side_effect": row["maybe_side_effect"],
                         "reason": "an execution is in progress or crashed"}
+            if row["maybe_side_effect"]:
+                return {"decision": CONFLICT, "attempt": row["attempt"], "status": "failed",
+                        "result_ref": row["result_ref"], "maybe_side_effect": True,
+                        "reason": MANUAL_RECONCILIATION_ERROR}
             if row["attempt"] >= MAX_TOOL_EFFECT_ATTEMPTS:
                 return {"decision": CONFLICT, "attempt": row["attempt"], "status": "failed",
                         "result_ref": row["result_ref"],
@@ -208,6 +214,31 @@ class InMemoryToolEffectRepository:
                 })
         return sorted(rows, key=lambda r: r["updated_at"])
 
+    def list_manual_reconciliation(self, approvals=None) -> list[dict]:
+        rows = []
+        with self._lock:
+            for row in self._items.values():
+                if row["status"] != "failed" or not row["maybe_side_effect"]:
+                    continue
+                try:
+                    approval = approvals.get(row["approval_id"]) if approvals else {}
+                except Exception:  # noqa: BLE001 - 视图允许审批已不存在
+                    approval = {}
+                rows.append({
+                    "tenant_id": row["tenant_id"],
+                    "approval_id": row["approval_id"],
+                    "tool_name": row["tool_name"],
+                    "args_hash": row["args_hash"],
+                    "status": row["status"],
+                    "attempt": row["attempt"],
+                    "maybe_side_effect": row["maybe_side_effect"],
+                    "last_error": row["last_error"],
+                    "updated_at": row["updated_at"],
+                    "approval_status": approval.get("status"),
+                    "approval_lease_until": approval.get("lease_until"),
+                })
+        return sorted(rows, key=lambda r: r["updated_at"])
+
     def get(self, tenant_id, approval_id, tool_name, args):
         return self._items.get(effect_key(tenant_id, approval_id, tool_name, args))
 
@@ -241,9 +272,10 @@ class PostgresToolEffectRepository:
             "SELECT status, attempt, result_ref, maybe_side_effect FROM agent_tool_effect "
             "WHERE tenant_id = ? AND approval_id = ? AND tool_name = ? AND args_hash = ?",
             (tenant, approval_id, tool_name, digest))
-        if row is None:  # 竞态下被删（当前无删除路径），按可执行处理
-            return {"decision": EXECUTE, "attempt": 1, "status": "started",
-                    "result_ref": None, "maybe_side_effect": False}
+        if row is None:
+            return {"decision": CONFLICT, "attempt": 0, "status": "unknown",
+                    "result_ref": None, "maybe_side_effect": True,
+                    "reason": "effect row unavailable"}
         if row["status"] == "succeeded":
             return {"decision": CACHED, "attempt": row["attempt"], "status": "succeeded",
                     "result_ref": row["result_ref"],
@@ -253,20 +285,47 @@ class PostgresToolEffectRepository:
                     "result_ref": None, "maybe_side_effect": bool(row["maybe_side_effect"]),
                     "reason": "an execution is in progress or crashed"}
 
+        if bool(row["maybe_side_effect"]):
+            return {"decision": CONFLICT, "attempt": int(row["attempt"]), "status": "failed",
+                    "result_ref": row.get("result_ref"), "maybe_side_effect": True,
+                    "reason": MANUAL_RECONCILIATION_ERROR}
+
         # status='failed'：条件更新只允许一次重试（attempt 1 -> 2）。
         claimed = self._c.execute_rowcount(
             "UPDATE agent_tool_effect SET status = 'started', attempt = attempt + 1, "
             "result_ref = NULL, maybe_side_effect = FALSE, updated_at = now() "
             "WHERE tenant_id = ? AND approval_id = ? AND tool_name = ? AND args_hash = ? "
-            "AND status = 'failed' AND attempt < ?",
+            "AND status = 'failed' AND maybe_side_effect = FALSE AND attempt < ?",
             (tenant, approval_id, tool_name, digest, MAX_TOOL_EFFECT_ATTEMPTS),
         )
         if claimed:
             return {"decision": EXECUTE, "attempt": int(row["attempt"]) + 1,
                     "status": "started", "result_ref": None, "maybe_side_effect": False}
-        return {"decision": CONFLICT, "attempt": row["attempt"], "status": "failed",
-                "result_ref": row.get("result_ref"),
-                "maybe_side_effect": bool(row["maybe_side_effect"]),
+
+        current = self._c.fetch_one(
+            "SELECT status, attempt, result_ref, maybe_side_effect FROM agent_tool_effect "
+            "WHERE tenant_id = ? AND approval_id = ? AND tool_name = ? AND args_hash = ?",
+            (tenant, approval_id, tool_name, digest),
+        )
+        if current is None:
+            return {"decision": CONFLICT, "attempt": 0, "status": "unknown",
+                    "result_ref": None, "maybe_side_effect": True,
+                    "reason": "effect row unavailable"}
+        if current["status"] == "succeeded":
+            return {"decision": CACHED, "attempt": current["attempt"],
+                    "status": "succeeded", "result_ref": current["result_ref"],
+                    "maybe_side_effect": bool(current["maybe_side_effect"])}
+        if current["status"] == "started":
+            return {"decision": CONFLICT, "attempt": current["attempt"],
+                    "status": "started", "result_ref": None,
+                    "maybe_side_effect": bool(current["maybe_side_effect"]),
+                    "reason": "an execution is in progress or crashed"}
+        if bool(current["maybe_side_effect"]):
+            return {"decision": CONFLICT, "attempt": int(current["attempt"]),
+                    "status": "failed", "result_ref": current.get("result_ref"),
+                    "maybe_side_effect": True, "reason": MANUAL_RECONCILIATION_ERROR}
+        return {"decision": CONFLICT, "attempt": current["attempt"], "status": "failed",
+                "result_ref": current.get("result_ref"), "maybe_side_effect": False,
                 "reason": "retry budget exhausted"}
 
     def succeed(self, tenant_id, approval_id, tool_name, args, ref):
@@ -318,6 +377,17 @@ class PostgresToolEffectRepository:
             (max(1, int(stale_seconds)),),
         )
 
+    def list_manual_reconciliation(self, approvals=None) -> list[dict]:
+        return self._c.fetch_all(
+            "SELECT e.tenant_id, e.approval_id, e.tool_name, e.args_hash, e.status, "
+            "e.attempt, e.maybe_side_effect, e.last_error, e.updated_at, "
+            "a.status AS approval_status, a.lease_until AS approval_lease_until "
+            "FROM agent_tool_effect AS e "
+            "LEFT JOIN agent_approval AS a ON a.id = e.approval_id "
+            "WHERE e.status = 'failed' AND e.maybe_side_effect = TRUE "
+            "ORDER BY e.updated_at",
+        )
+
     def get(self, tenant_id, approval_id, tool_name, args):
         return self._c.fetch_one(
             "SELECT tenant_id, approval_id, tool_name, args_hash, status, attempt, "
@@ -365,6 +435,9 @@ class ToolEffectStore:
     def list_stale_started(self, approvals=None, stale_seconds=None) -> list[dict]:
         seconds = tool_effect_stale_seconds() if stale_seconds is None else int(stale_seconds)
         return self._repo.list_stale_started(seconds, approvals)
+
+    def list_manual_reconciliation(self, approvals=None) -> list[dict]:
+        return self._repo.list_manual_reconciliation(approvals)
 
     def get(self, tenant_id, approval_id, tool_name, args):
         return self._repo.get(tenant_id, approval_id, tool_name, args)

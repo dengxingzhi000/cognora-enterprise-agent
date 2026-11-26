@@ -1,6 +1,11 @@
 """Stage0 DeepSeek连通检查: python scripts/check_deepseek.py"""
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 from openai import OpenAI
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 api_key = os.getenv("DEEPSEEK_API_KEY", "")
 base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")

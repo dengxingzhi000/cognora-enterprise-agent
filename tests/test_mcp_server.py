@@ -3,18 +3,23 @@ import pytest
 
 
 def test_tool_specs_match_registry_descriptions():
-    from agent.tools.builtin import build_default_registry
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
     from agent.mcp.server import build_tool_specs
+    from agent.tools.builtin import build_default_registry
 
     reg = build_default_registry()
     specs = build_tool_specs(reg)
     assert [s.name for s in specs] == ["metrics.get", "logs.search", "git.diff"]
     for spec in specs:
-        assert spec.description == reg.get(spec.name).description
+        tool = reg.get(spec.name)
+        assert spec.description == tool.description
+        assert spec.input_schema == convert_to_openai_tool(tool.structured_tool)["function"]["parameters"]
         assert spec.input_schema["type"] == "object"
 
 
-def test_call_tool_returns_mcp_content_shape():
+def test_call_tool_returns_mcp_content_shape(monkeypatch):
+    monkeypatch.setenv("AGENT_ENABLE_MOCK_TOOLS", "1")
     from agent.mcp.server import call_tool
 
     result = call_tool("metrics.get", {"service": "order"})
@@ -49,7 +54,8 @@ def test_build_server_degrades_when_mcp_missing(monkeypatch):
         server_mod.build_server()
 
 
-def test_build_server_registers_tools_with_fake_transport():
+def test_build_server_registers_tools_with_fake_transport(monkeypatch):
+    monkeypatch.setenv("AGENT_ENABLE_MOCK_TOOLS", "1")
     from agent.mcp.server import build_server, build_tool_specs
     from agent.tools.builtin import build_default_registry
 
@@ -79,7 +85,8 @@ def test_mcp_available_probe_is_boolean():
     assert isinstance(mcp_available(), bool)
 
 
-def test_real_server_if_mcp_installed():
+def test_real_server_if_mcp_installed(monkeypatch):
+    monkeypatch.setenv("AGENT_ENABLE_MOCK_TOOLS", "1")
     pytest.importorskip("mcp")
     from agent.mcp.server import build_server, mcp_available
     if not mcp_available():

@@ -1,44 +1,68 @@
-def test_checkpointer_falls_back_without_pg():
+import pytest
+
+
+def test_explicit_pg_failure_does_not_silently_downgrade():
+    from workflow.checkpoint import CheckpointUnavailable, get_checkpointer
+
+    with pytest.raises(CheckpointUnavailable):
+        get_checkpointer(dsn="postgresql://invalid:1@127.0.0.1:1/nope")
+
+
+def test_strict_mode_rejects_unavailable_env_checkpointer(monkeypatch):
+    from workflow.checkpoint import CheckpointUnavailable, get_checkpointer
+
+    monkeypatch.setenv("AGENT_STRICT_PERSISTENCE", "true")
+    monkeypatch.setenv("AGENT_PG_DSN", "postgresql://invalid:1@127.0.0.1:1/nope")
+    with pytest.raises(CheckpointUnavailable):
+        get_checkpointer()
+
+
+def test_no_dsn_uses_native_memory_saver():
+    from langgraph.checkpoint.memory import MemorySaver
+
     from workflow.checkpoint import get_checkpointer
-    cp = get_checkpointer(dsn="postgresql://invalid:1@127.0.0.1:1/nope")
-    tid = "t-fallback-1"
-    cp.put(tid, {"node": "judge", "trace": ["fetch"]})
-    assert cp.get(tid)["node"] == "judge"
+
+    assert isinstance(get_checkpointer(dsn=None), MemorySaver)
 
 
 def test_expense_pause_and_resume_same_thread():
-    from workflow.graph_lang import build_expense_graph
     from workflow.checkpoint import get_checkpointer
+    from workflow.graph_lang import build_expense_graph
     cp = get_checkpointer(dsn=None)
     g = build_expense_graph(policy_threshold=5000, checkpointer=cp)
     first = g.invoke({"expense": {"id": "E9", "amount": 6230}}, config={"configurable": {"thread_id": "task-9"}})
     assert first["decision"] in ("paused_human_review", "human_review")
-    g2 = build_expense_graph(policy_threshold=5000, checkpointer=cp)
+    pending = [item for item in g.approvals.list_items()
+               if item["args"].get("thread_id") == "task-9"]
+    g.approvals.approve(pending[0]["id"], "manager")
+    g2 = build_expense_graph(policy_threshold=5000, checkpointer=cp,
+                             approval_store=g.approvals)
     done = g2.invoke(None, config={"configurable": {"thread_id": "task-9"}})
     assert done["decision"] == "human_review"
     assert "judge_rule" in done["trace"]
 
 
-def test_tool_timeout_retry_then_fallback_and_idempotent():
-    from workflow.durable import run_with_retry, IdempotencyStore, LoopDetector
+def test_graph_node_retries_with_framework_backoff(monkeypatch):
+    import time
+
+    import workflow.nodes.expense as n
+    from workflow.graph_lang import build_expense_graph
+
     calls = {"n": 0}
-    def flaky():
+    original = n.fetch_expense
+
+    def flaky(state):
         calls["n"] += 1
         if calls["n"] < 3:
             raise TimeoutError("tool timeout")
-        return "ok-fallback"
-    store = IdempotencyStore()
-    out = run_with_retry("task-7:toolB", flaky, store=store, retries=3, timeout=1.0, backoff=0.0)
-    assert out == "ok-fallback"
+        return original(state)
+
+    monkeypatch.setattr(n, "fetch_expense", flaky)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    result = build_expense_graph().invoke({"expense": {"id": "E1", "amount": 100}})
+
+    assert result["decision"] == "auto_approve"
     assert calls["n"] == 3
-    out2 = run_with_retry("task-7:toolB", flaky, store=store, retries=3, timeout=1.0, backoff=0.0)
-    assert out2 == "ok-fallback"
-    assert calls["n"] == 3
-    det = LoopDetector(limit=3)
-    assert det.visit("judge") is False
-    assert det.visit("judge") is False
-    assert det.visit("judge") is False
-    assert det.visit("judge") is True
 
 
 def test_parity_still_holds_with_durable_graph():
@@ -82,9 +106,9 @@ def test_saver_adapter_delegates_to_native():
 
 
 def test_pause_creates_approval_pending_entry_and_resume():
-    from workflow.graph_lang import build_expense_graph
-    from workflow.checkpoint import get_checkpointer
     from security.approval import ApprovalStore
+    from workflow.checkpoint import get_checkpointer
+    from workflow.graph_lang import build_expense_graph
     approvals = ApprovalStore()
     cp = get_checkpointer(dsn=None)
     g = build_expense_graph(policy_threshold=5000, checkpointer=cp, approval_store=approvals)
@@ -93,22 +117,16 @@ def test_pause_creates_approval_pending_entry_and_resume():
     assert first["decision"] in ("paused_human_review", "human_review")
     pendings = [v for v in approvals._items.values() if v["status"] == "pending"]
     assert len(pendings) >= 1, "pause must dual-write ApprovalStore pending entry"
+    approvals.approve(pendings[0]["id"], "manager")
     done = g.invoke(None, config={"configurable": {"thread_id": "task-apr-1"}})
     assert done["decision"] == "human_review"
 
 
-def test_run_with_retry_default_backoff_is_spec_1s():
-    import inspect
-    from workflow.durable import run_with_retry
-    sig = inspect.signature(run_with_retry)
-    assert sig.parameters["backoff"].default == 1.0, "spec backoff 1s/2s/4s requires default 1.0"
-
-
 def test_fault_chain_timeout_retry_fallback_human_trace_order():
-    from workflow.graph_lang import build_expense_graph
-    from workflow.checkpoint import get_checkpointer
-    from security.approval import ApprovalStore
     import workflow.nodes.expense as n
+    from security.approval import ApprovalStore
+    from workflow.checkpoint import get_checkpointer
+    from workflow.graph_lang import build_expense_graph
 
     orig = n.check_amount
 
@@ -142,10 +160,10 @@ def test_fault_chain_timeout_retry_fallback_human_trace_order():
         n.check_amount = orig
 
 
-def test_graph_level_idempotent_no_double_call():
-    from workflow.graph_lang import build_expense_graph
-    from workflow.checkpoint import get_checkpointer
+def test_graph_checkpoint_prevents_completed_node_replay():
     import workflow.nodes.expense as n
+    from workflow.checkpoint import get_checkpointer
+    from workflow.graph_lang import build_expense_graph
 
     calls = {"n": 0}
     orig_fetch = n.fetch_expense
@@ -159,16 +177,15 @@ def test_graph_level_idempotent_no_double_call():
         cp = get_checkpointer(dsn=None)
         g = build_expense_graph(policy_threshold=5000, checkpointer=cp)
         tid = "idem-graph-1"
-        exp = {"id": "E-idem-1", "amount": 100}
+        exp = {"id": "E-idem-1", "amount": 10000}
         first = g.invoke({"expense": dict(exp)}, config={"configurable": {"thread_id": tid}})
-        n1 = calls["n"]
-        trace_len1 = len(first.get("trace", []))
-        second = g.invoke({"expense": dict(exp)}, config={"configurable": {"thread_id": tid}})
-        assert calls["n"] == n1, f"second invoke re-ran nodes: {calls['n']} vs {n1}"
-        assert len(second.get("trace", [])) == trace_len1, (first, second)
-        store = getattr(g, "idempotency_store", None) or getattr(g, "_idem_store", None)
-        assert store is not None, "graph adapter must expose idempotency store (guard wired)"
-        mem = getattr(store, "_mem", {})
-        assert any(k.startswith(f"{tid}:") for k in mem.keys()), f"keys must use thread_id:node prefix, got {list(mem.keys())}"
+        assert first["decision"] == "paused_human_review"
+        pending = [item for item in g.approvals.list_items()
+                   if item["args"].get("thread_id") == tid]
+        g.approvals.approve(pending[0]["id"], "manager")
+        done = g.invoke(None, config={"configurable": {"thread_id": tid}})
+        assert done["decision"] == "human_review"
+        assert calls["n"] == 1, f"resume replayed completed fetch: {calls['n']}"
+        assert done["trace"].count("fetch") == 1
     finally:
         n.fetch_expense = orig_fetch

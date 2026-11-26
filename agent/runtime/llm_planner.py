@@ -2,7 +2,6 @@
 import json
 import os
 
-
 SYSTEM_PROMPT = (
     "你是企业运维助手Planner。只输出JSON，不要markdown。\n"
     '格式1 结束: {"action":"finish","answer":"..."}\n'
@@ -35,25 +34,45 @@ def _parse_json(text: str) -> dict:
     return json.loads(t.strip())
 
 
+def _planner_system_prompt() -> str:
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
+    from agent.tools.executor import _registry
+
+    catalog = [
+        convert_to_openai_tool(_registry().get(name).structured_tool)
+        for name in _registry().list_tools()
+    ]
+    return (SYSTEM_PROMPT + "\n可用工具及参数Schema:\n"
+            + json.dumps(catalog, ensure_ascii=False, separators=(",", ":")))
+
+
+def planner_prompt_tokens(client=None) -> int:
+    return 0 if client is None else max(1, len(_planner_system_prompt()) // 4)
+
+
 def build_deepseek_planner(client=None, model: str = "deepseek-chat"):
+    system_prompt = _planner_system_prompt() if client is not None else SYSTEM_PROMPT
+
     def planner(state) -> dict:
         if client is None:
             return {"action": "finish", "answer": f"[runtime-echo] {state.task}"}
-        user_content = f"任务: {state.task}\n历史: {state.messages[-3:]}"
+        history = [message for message in state.messages if message.get("role") != "system"]
+        user_content = f"任务: {state.task}\n上下文: {json.dumps(history, ensure_ascii=False)}"
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            max_tokens=300,
+            max_tokens=max(1, int(os.getenv("AGENT_PLANNER_MAX_TOKENS", "300"))),
         )
         text = resp.choices[0].message.content or ""
         try:
             plan = _parse_json(text)
         except Exception:
             return {"action": "finish", "answer": text}
-        if plan.get("action") not in ("finish", "call_tool"):
+        if not isinstance(plan, dict) or plan.get("action") not in ("finish", "call_tool"):
             return {"action": "finish", "answer": text}
         return plan
 

@@ -1,0 +1,154 @@
+[
+  {
+    "article_id": "order-create-server-error",
+    "version": "v1",
+    "title": "下单接口 5xx 或超时",
+    "summary": "先确认请求是否已落库，再排查服务错误，避免重复提交。",
+    "steps": [
+      "保存订单号和请求时间，检查订单列表是否已经存在相同订单。",
+      "查看服务端错误率与日志，确认是数据库、消息队列还是下游接口异常。",
+      "仅在确认没有副作用后重试；结果不明确时转人工对账。"
+    ],
+    "modules": ["order"],
+    "workflows": ["create_order"],
+    "error_codes": ["SERVER_ERROR", "NETWORK", "TIMEOUT"],
+    "permission": "employee",
+    "requires_approval": false,
+    "approval_hint": null,
+    "source": "curated-runbook",
+    "updated_at": "2026-11-25T00:00:00+00:00"
+  },
+  {
+    "article_id": "order-create-validation",
+    "version": "v1",
+    "title": "订单字段校验失败",
+    "summary": "定位首个校验错误，修正字段后再提交，不要反复重试同一请求。",
+    "steps": [
+      "展开校验提示，记录字段名和错误码。",
+      "检查必填项、数量精度、金额上限和商品状态。",
+      "修正后重新预览订单，再执行提交。"
+    ],
+    "modules": ["order"],
+    "workflows": ["create_order"],
+    "error_codes": ["VALIDATION", "BUSINESS_REJECTION", "CONFLICT"],
+    "permission": "employee",
+    "requires_approval": false,
+    "approval_hint": null,
+    "source": "curated-runbook",
+    "updated_at": "2026-11-25T00:00:00+00:00"
+  },
+  {
+    "article_id": "inventory-adjust-permission",
+    "version": "v1",
+    "title": "库存调整权限不足",
+    "summary": "库存调整涉及审计与审批，需要具备对应角色后由授权人员处理。",
+    "steps": [
+      "确认仓库、库存类型和调整原因。",
+      "提交权限或审批申请，附上库存流水与业务单据。",
+      "不要借用管理员账号或绕过审批直接调整库存。"
+    ],
+    "modules": ["inventory"],
+    "workflows": ["adjust_stock"],
+    "error_codes": ["FORBIDDEN", "UNAUTHORIZED"],
+    "permission": "manager",
+    "requires_approval": true,
+    "approval_hint": "仓库负责人或租户管理员审批",
+    "source": "curated-runbook",
+    "updated_at": "2026-11-25T00:00:00+00:00"
+  },
+  {
+    "article_id": "purchase-create-validation",
+    "version": "v1",
+    "title": "采购单字段校验失败",
+    "summary": "检查供应商、交期、税率和明细完整性后再提交采购单。",
+    "steps": [
+      "确认供应商状态和采购组织有效。",
+      "检查商品明细数量、含税单价与税率精度。",
+      "补齐合同或收货信息后重新提交。"
+    ],
+    "modules": ["purchase"],
+    "workflows": ["create_purchase_order"],
+    "error_codes": ["VALIDATION", "NOT_FOUND", "BUSINESS_REJECTION"],
+    "permission": "employee",
+    "requires_approval": false,
+    "approval_hint": null,
+    "source": "curated-runbook",
+    "updated_at": "2026-11-25T00:00:00+00:00"
+  },
+  {
+    "article_id": "finance-invoice-rejection",
+    "version": "v1",
+    "title": "发票或结算被驳回",
+    "summary": "按驳回原因修正票据信息，保留原始单据和审批记录。",
+    "steps": [
+      "记录驳回原因和当前审批节点。",
+      "核对金额、税率、抬头与银行账户。",
+      "补充证明材料后重新提交财务审批。"
+    ],
+    "modules": ["finance"],
+    "workflows": ["create_invoice"],
+    "error_codes": ["BUSINESS_REJECTION", "VALIDATION", "CONFLICT"],
+    "permission": "finance",
+    "requires_approval": true,
+    "approval_hint": "财务复核",
+    "source": "curated-runbook",
+    "updated_at": "2026-11-25T00:00:00+00:00"
+  },
+  {
+    "article_id": "system-role-approval",
+    "version": "v1",
+    "title": "角色或权限变更审批",
+    "summary": "权限变更必须遵循最小权限原则，并由平台管理员审批。",
+    "steps": [
+      "确认目标用户、角色和权限范围。",
+      "说明业务原因并设置到期时间。",
+      "审批通过后重新登录并验证权限，保留审计记录。"
+    ],
+    "modules": ["system"],
+    "workflows": ["assign_role"],
+    "error_codes": ["FORBIDDEN", "UNAUTHORIZED", "BUSINESS_REJECTION"],
+    "permission": "admin",
+    "requires_approval": true,
+    "approval_hint": "平台管理员审批",
+    "source": "curated-runbook",
+    "updated_at": "2026-11-25T00:00:00+00:00"
+  },
+  {
+    "article_id": "general-timeout-recovery",
+    "version": "v1",
+    "title": "操作超时后的恢复",
+    "summary": "先确认操作结果，再决定是否重试，避免重复写入。",
+    "steps": [
+      "刷新列表或详情，确认数据是否已经更新。",
+      "查看服务端结果或审计记录，判断请求是否完成。",
+      "只有确认无副作用后才重试，否则转人工处理。"
+    ],
+    "modules": ["*"],
+    "workflows": ["*"],
+    "error_codes": ["TIMEOUT", "NETWORK", "SERVER_ERROR"],
+    "permission": "employee",
+    "requires_approval": false,
+    "approval_hint": null,
+    "source": "curated-runbook",
+    "updated_at": "2026-11-25T00:00:00+00:00"
+  },
+  {
+    "article_id": "supplier-review-documents",
+    "version": "v1",
+    "title": "供应商资料不完整",
+    "summary": "补齐资质、有效期和联系人信息后再提交供应商评审。",
+    "steps": [
+      "检查资质证书是否过期或字段缺失。",
+      "联系供应商补充营业执照、纳税信息和联系人。",
+      "重新提交评审并跟踪审批状态。"
+    ],
+    "modules": ["supplier"],
+    "workflows": ["review_supplier"],
+    "error_codes": ["VALIDATION", "NOT_FOUND", "BUSINESS_REJECTION"],
+    "permission": "employee",
+    "requires_approval": false,
+    "approval_hint": null,
+    "source": "curated-runbook",
+    "updated_at": "2026-11-25T00:00:00+00:00"
+  }
+]

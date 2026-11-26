@@ -8,12 +8,14 @@ langgraph = pytest.importorskip("langgraph")
 
 
 def test_real_state_graph_path_with_memory_saver():
+    from langgraph.graph.state import CompiledStateGraph
+
     from workflow.checkpoint import get_checkpointer
     from workflow.graph_lang import build_expense_graph
 
     cp = get_checkpointer(dsn=None)
     g = build_expense_graph(policy_threshold=5000, checkpointer=cp)
-    assert type(g).__name__ == "_RealAdapter"
+    assert isinstance(g.compiled, CompiledStateGraph)
     out = g.invoke({"expense": {"id": "E-real-1", "amount": 100}},
                    config={"configurable": {"thread_id": "real-auto-1"}})
     assert out["decision"] == "auto_approve"
@@ -21,7 +23,7 @@ def test_real_state_graph_path_with_memory_saver():
 
 
 def test_real_graph_pause_and_resume_with_memory_saver():
-    from workflow.checkpoint import get_checkpointer
+    from workflow.checkpoint import get_checkpointer, native_saver_of
     from workflow.graph_lang import build_expense_graph
 
     cp = get_checkpointer(dsn=None)
@@ -30,10 +32,14 @@ def test_real_graph_pause_and_resume_with_memory_saver():
     first = g.invoke({"expense": {"id": "E-real-2", "amount": 6230}},
                      config={"configurable": {"thread_id": tid}})
     assert first["decision"] == "paused_human_review"
-    raw = cp.native.get_tuple({"configurable": {"thread_id": tid}})
+    raw = native_saver_of(cp).get_tuple({"configurable": {"thread_id": tid}})
     assert raw is not None and raw.pending_writes
 
-    g2 = build_expense_graph(policy_threshold=5000, checkpointer=cp)
+    g2 = build_expense_graph(policy_threshold=5000, checkpointer=cp,
+                             approval_store=g.approvals)
+    pending = [item for item in g.approvals.list_items()
+               if item["args"].get("thread_id") == tid]
+    g.approvals.approve(pending[0]["id"], "manager")
     done = g2.invoke(None, config={"configurable": {"thread_id": tid}})
     assert done["decision"] == "human_review"
     assert "judge_rule" in done["trace"]
@@ -42,7 +48,7 @@ def test_real_graph_pause_and_resume_with_memory_saver():
 @pytest.mark.skipif(not os.environ.get("AGENT_TEST_PG_DSN"),
                     reason="AGENT_TEST_PG_DSN not set; real Postgres checkpoint skipped")
 def test_postgres_checkpoint_persist_read_and_resume():
-    from workflow.checkpoint import get_checkpointer
+    from workflow.checkpoint import get_checkpointer, native_saver_of
     from workflow.graph_lang import build_expense_graph
 
     dsn = os.environ["AGENT_TEST_PG_DSN"]
@@ -56,18 +62,22 @@ def test_postgres_checkpoint_persist_read_and_resume():
                          config={"configurable": {"thread_id": tid}})
         assert first["decision"] == "paused_human_review"
 
-        raw = cp.native.get_tuple({"configurable": {"thread_id": tid}})
+        raw = native_saver_of(cp).get_tuple({"configurable": {"thread_id": tid}})
         assert raw is not None
         assert raw.checkpoint["channel_values"]["__root__"]["expense"]["id"] == "E-pg-1"
 
         # 新 saver 连接按同一 thread_id 读取 checkpoint 并恢复。
         cp2 = get_checkpointer(dsn=dsn)
         assert cp2.get(tid) is not None
-        g2 = build_expense_graph(policy_threshold=5000, checkpointer=cp2)
+        g2 = build_expense_graph(policy_threshold=5000, checkpointer=cp2,
+                                 approval_store=g.approvals)
+        pending = [item for item in g.approvals.list_items()
+                   if item["args"].get("thread_id") == tid]
+        g.approvals.approve(pending[0]["id"], "manager")
         done = g2.invoke(None, config={"configurable": {"thread_id": tid}})
         assert done["decision"] == "human_review"
         assert done["state"]["need_human"] is True
-        assert not (cp2.native.get_tuple({"configurable": {"thread_id": tid}}).pending_writes)
+        assert not (native_saver_of(cp2).get_tuple({"configurable": {"thread_id": tid}}).pending_writes)
     finally:
         if cp2 is not None:
             cp2.close()

@@ -54,7 +54,9 @@ class ContextAssembler:
                     summary["idx"] = len(new_segs)
                     new_segs.append(summary)
                     for k in kept:
-                        k = dict(k); k["idx"] = len(new_segs); new_segs.append(k)
+                        k = dict(k)
+                        k["idx"] = len(new_segs)
+                        new_segs.append(k)
                     compressed.append({"provider": layer,
                                        "before": len(layer_segs),
                                        "after": 1 + len(kept),

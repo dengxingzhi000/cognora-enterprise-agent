@@ -1,6 +1,6 @@
 """Stage5 RED: Tool前必须过Policy，高风险必须HITL。"""
-from security.policy import PolicyEngine
 from security.approval import ApprovalStore
+from security.policy import PolicyEngine
 
 
 def _user(role, dept="ops"):

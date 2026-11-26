@@ -1,118 +1,99 @@
-"""Prometheus 指标（可选依赖）。
-
-安装 ``prometheus-client`` 时用官方 registry；未安装时用进程内计数器，
-仍然以 Prometheus 文本格式暴露 ``/metrics``（只是没有 exporter 聚合）。
-"""
+"""Prometheus metrics backed exclusively by the official client library."""
 from __future__ import annotations
 
 import threading
 
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    REGISTRY,
+    CollectorRegistry,
+    Counter,
+    Gauge,
+    Histogram,
+    PlatformCollector,
+    ProcessCollector,
+    generate_latest,
+)
+
 
 class MetricsUnavailable(RuntimeError):
-    """保留给自定义后端；内存后端不会抛出。"""
+    """Raised when the required Prometheus client cannot be loaded."""
 
 
-MEMORY_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
-
-
-def _escape(value: str) -> str:
-    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-
-
-class MemoryMetrics:
-    """无 exporter 时的内存计数器；可在 /metrics 上读到真实数值。"""
-
-    available = False
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._series: dict[tuple, dict] = {}
-
-    def _inc(self, name: str, labels: dict | None = None, amount: int = 1) -> None:
-        labels = labels or {}
-        key = (name, tuple(sorted(labels.items())))
-        with self._lock:
-            entry = self._series.setdefault(
-                key, {"name": name, "labels": labels, "value": 0})
-            entry["value"] += int(amount)
-
-    def value(self, name: str, labels: dict | None = None) -> int:
-        """测试/诊断用：读取某个序列的当前值（不存在为 0）。"""
-        key = (name, tuple(sorted((labels or {}).items())))
-        with self._lock:
-            return int(self._series.get(key, {}).get("value", 0))
-
-    def inc_task_status(self, status: str) -> None:
-        self._inc("agent_task_total", {"status": status or "unknown"})
-
-    def record_tool_call(self, tool: str, ok: bool) -> None:
-        self._inc("agent_tool_calls_total",
-                  {"tool": tool or "unknown", "result": "ok" if ok else "error"})
-
-    def record_trace_event(self, stage: str) -> None:
-        self._inc("agent_trace_events_total", {"stage": stage or "unknown"})
-
-    def inc_approval_reclaimed(self, amount: int = 1) -> None:
-        self._inc("approval_reclaimed_total", amount=amount)
-
-    def inc_approval_lease_lost(self) -> None:
-        self._inc("approval_lease_lost_total")
-
-    def inc_approval_heartbeat_failed(self) -> None:
-        self._inc("approval_heartbeat_failed_total")
-
-    def inc_tool_effect_reclaimed(self, amount: int = 1) -> None:
-        self._inc("tool_effect_reclaimed_total", amount=amount)
-
-    def render(self) -> tuple[bytes, str]:
-        lines = []
-        with self._lock:
-            for entry in self._series.values():
-                labels = entry["labels"]
-                label_text = ""
-                if labels:
-                    pairs = ",".join(f'{k}="{_escape(v)}"'
-                                     for k, v in sorted(labels.items()))
-                    label_text = "{" + pairs + "}"
-                lines.append(f'{entry["name"]}{label_text} {entry["value"]}')
-        body = "\n".join(sorted(lines)) + "\n"
-        return body.encode(), MEMORY_CONTENT_TYPE
-
-
-class _PrometheusMetrics:
+class PrometheusMetrics:
     available = True
 
-    def __init__(self, module):
-        self._module = module
-        try:
-            self._task = module.Counter(
-                "agent_task_total", "Agent task terminal status", ["status"])
-            self._tool = module.Counter(
-                "agent_tool_calls_total", "Tool calls by tool name and result", ["tool", "result"])
-            self._event = module.Counter(
-                "agent_trace_events_total", "Trace events by stage", ["stage"])
-        except Exception:  # noqa: BLE001 - duplicate registration on reload
-            registry = module.REGISTRY
-            self._task = registry._names_to_collectors["agent_task_total"]
-            self._tool = registry._names_to_collectors["agent_tool_calls_total"]
-            self._event = registry._names_to_collectors["agent_trace_events_total"]
-        self._reclaimed = self._counter(module, "approval_reclaimed_total",
-                                        "Expired approval claims reclaimed")
-        self._lease_lost = self._counter(module, "approval_lease_lost_total",
-                                         "Approval leases lost during execution")
+    def __init__(self, registry: CollectorRegistry | None = None):
+        self.registry = registry if registry is not None else REGISTRY
+        if registry is None:
+            for collector in (ProcessCollector, PlatformCollector):
+                try:
+                    self.registry.register(collector())
+                except ValueError:
+                    pass
+        self._task = self._counter(
+            "agent_task_total", "Agent task terminal status", ["status"])
+        self._tool = self._counter(
+            "agent_tool_calls_total", "Tool calls by tool name and result",
+            ["tool", "result"])
+        self._event = self._counter(
+            "agent_trace_events_total", "Trace events by stage", ["stage"])
+        self._reclaimed = self._counter(
+            "approval_reclaimed_total", "Expired approval claims reclaimed")
+        self._lease_lost = self._counter(
+            "approval_lease_lost_total", "Approval leases lost during execution")
         self._heartbeat_failed = self._counter(
-            module, "approval_heartbeat_failed_total",
-            "Approval heartbeat renewal failures")
+            "approval_heartbeat_failed_total", "Approval heartbeat renewal failures")
         self._effect_reclaimed = self._counter(
-            module, "tool_effect_reclaimed_total",
-            "Stale started write-tool effects reclaimed")
+            "tool_effect_reclaimed_total", "Stale started write-tool effects reclaimed")
+        self._assistance_prediction = self._counter(
+            "agent_assistance_predictions_total", "AI assistance predictions by decision", ["decision"])
+        self._assistance_feedback = self._counter(
+            "agent_assistance_feedback_total", "AI assistance feedback by source", ["source"])
+        self._assistance_probability = self._histogram(
+            "agent_assistance_probability",
+            "AI assistance predicted probability",
+            [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0],
+        )
+        self._assistance_duration = self._histogram(
+            "agent_assistance_prediction_duration_seconds",
+            "AI assistance prediction latency",
+            [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+        )
+        self._assistance_knowledge_recommendations = self._counter(
+            "agent_assistance_knowledge_recommendations_total",
+            "Intervention knowledge recommendations returned",
+        )
+        self._assistance_knowledge_feedback = self._counter(
+            "agent_assistance_knowledge_feedback_total",
+            "Intervention knowledge feedback by helpfulness",
+            ["helpful"],
+        )
+        self._assistance_drift = self._gauge(
+            "agent_assistance_probability_drift",
+            "Live mean probability delta from the model baseline",
+        )
 
-    @staticmethod
-    def _counter(module, name: str, doc: str):
+    def _counter(self, name: str, doc: str, labels: list[str] | None = None):
         try:
-            return module.Counter(name, doc)
-        except Exception:  # noqa: BLE001 - duplicate registration on reload
-            return module.REGISTRY._names_to_collectors[name]
+            return Counter(name, doc, labels or [], registry=self.registry)
+        except ValueError:
+            return self.registry._names_to_collectors[name]
+
+    def _histogram(self, name: str, doc: str, buckets: list[float]):
+        try:
+            return Histogram(name, doc, buckets=buckets, registry=self.registry)
+        except ValueError:
+            return self.registry._names_to_collectors[name]
+
+    def _gauge(self, name: str, doc: str):
+        try:
+            return Gauge(name, doc, registry=self.registry)
+        except ValueError:
+            return self.registry._names_to_collectors[name]
+
+    def value(self, name: str, labels: dict | None = None) -> float:
+        return float(self.registry.get_sample_value(name, labels or {}) or 0)
 
     def inc_task_status(self, status: str) -> None:
         self._task.labels(status=status or "unknown").inc()
@@ -135,48 +116,51 @@ class _PrometheusMetrics:
     def inc_tool_effect_reclaimed(self, amount: int = 1) -> None:
         self._effect_reclaimed.inc(int(amount))
 
+    def inc_assistance_prediction(self, decision: str) -> None:
+        allowed = {"OFFER_ASSISTANCE", "DO_NOT_INTERRUPT"}
+        self._assistance_prediction.labels(decision=decision if decision in allowed else "unknown").inc()
+
+    def inc_assistance_feedback(self, source: str) -> None:
+        allowed = {"OPERATOR", "OUTCOME", "REVIEWER"}
+        self._assistance_feedback.labels(source=source if source in allowed else "unknown").inc()
+
+    def observe_assistance_prediction(self, probability: float, duration_seconds: float) -> None:
+        self._assistance_probability.observe(max(0.0, min(1.0, probability)))
+        self._assistance_duration.observe(max(0.0, duration_seconds))
+
+    def inc_assistance_knowledge_recommendation(self, amount: int = 1) -> None:
+        self._assistance_knowledge_recommendations.inc(int(amount))
+
+    def inc_assistance_knowledge_feedback(self, helpful: bool) -> None:
+        self._assistance_knowledge_feedback.labels(
+            helpful="yes" if helpful else "no"
+        ).inc()
+
+    def set_assistance_drift(self, delta: float) -> None:
+        self._assistance_drift.set(delta)
+
     def render(self) -> tuple[bytes, str]:
-        return self._module.generate_latest(), self._module.CONTENT_TYPE_LATEST
+        return generate_latest(self.registry), CONTENT_TYPE_LATEST
 
 
 _LOCK = threading.Lock()
-_BACKEND = None
+_BACKEND: PrometheusMetrics | None = None
 
 
-def _build_prometheus():
-    from types import SimpleNamespace
-    from prometheus_client import (CONTENT_TYPE_LATEST, REGISTRY,  # noqa: F401
-                                   Counter, generate_latest)
-    module = SimpleNamespace(
-        Counter=Counter,
-        generate_latest=generate_latest,
-        CONTENT_TYPE_LATEST=CONTENT_TYPE_LATEST,
-        REGISTRY=REGISTRY,
-    )
-    return _PrometheusMetrics(module)
-
-
-def _load_backend():
+def _load_backend() -> PrometheusMetrics:
     global _BACKEND
     with _LOCK:
-        if _BACKEND is not None:
-            return _BACKEND
-        try:
-            _BACKEND = _build_prometheus()
-        except Exception:  # noqa: BLE001 - 无依赖时回落内存计数
-            _BACKEND = MemoryMetrics()
+        if _BACKEND is None:
+            _BACKEND = PrometheusMetrics()
         return _BACKEND
 
 
-def configure_metrics(backend=None, memory: bool = False):
-    """显式注入（测试/自定义后端）；``None`` 触发自动探测，``memory=True`` 强制内存后端。"""
+def configure_metrics(backend=None, registry: CollectorRegistry | None = None):
+    """Inject a backend or an isolated official registry for tests."""
     global _BACKEND
     with _LOCK:
-        if memory:
-            _BACKEND = MemoryMetrics()
-        else:
-            _BACKEND = backend if backend is not None else MemoryMetrics()
-    return _BACKEND
+        _BACKEND = backend if backend is not None else PrometheusMetrics(registry)
+        return _BACKEND
 
 
 def reset_metrics() -> None:
@@ -186,7 +170,10 @@ def reset_metrics() -> None:
 
 
 def metrics_available() -> bool:
-    return bool(_load_backend().available)
+    try:
+        return _load_backend().available
+    except MetricsUnavailable:
+        return False
 
 
 def render_metrics() -> tuple[bytes, str]:
@@ -238,5 +225,47 @@ def inc_approval_heartbeat_failed() -> None:
 def inc_tool_effect_reclaimed(amount: int = 1) -> None:
     try:
         _load_backend().inc_tool_effect_reclaimed(amount)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def inc_assistance_prediction(decision: str) -> None:
+    try:
+        _load_backend().inc_assistance_prediction(decision)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def inc_assistance_feedback(source: str) -> None:
+    try:
+        _load_backend().inc_assistance_feedback(source)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def observe_assistance_prediction(probability: float, duration_seconds: float) -> None:
+    try:
+        _load_backend().observe_assistance_prediction(probability, duration_seconds)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def inc_assistance_knowledge_recommendation(amount: int = 1) -> None:
+    try:
+        _load_backend().inc_assistance_knowledge_recommendation(amount)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def inc_assistance_knowledge_feedback(helpful: bool) -> None:
+    try:
+        _load_backend().inc_assistance_knowledge_feedback(helpful)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def set_assistance_drift(delta: float) -> None:
+    try:
+        _load_backend().set_assistance_drift(delta)
     except Exception:  # noqa: BLE001
         pass

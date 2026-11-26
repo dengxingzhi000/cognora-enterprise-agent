@@ -1,4 +1,4 @@
-"""agent/runtime/counter.py: Token Counter + Pricing（Tiktoken 优先 / 启发兜底）。"""
+"""Token Counter + Pricing（默认启发计数，AGENT_TOKEN_COUNTER=tiktoken 显式启用）。"""
 import os
 import warnings
 from dataclasses import dataclass
@@ -35,7 +35,7 @@ class TiktokenCounter(BaseCounter):
             import tiktoken
             self._enc = tiktoken.get_encoding(encoding_name)
         except Exception as e:  # noqa: BLE001
-            raise EncodingUnavailable(str(e))
+            raise EncodingUnavailable(str(e)) from e
 
     def count_messages(self, messages: list[dict]) -> dict:
         total = 0
@@ -46,10 +46,12 @@ class TiktokenCounter(BaseCounter):
 
 
 def get_counter() -> BaseCounter:
+    if os.getenv("AGENT_TOKEN_COUNTER", "heuristic") != "tiktoken":
+        return HeuristicCounter()
     try:
         return TiktokenCounter()
     except EncodingUnavailable as e:
-        warnings.warn(f"tiktoken unavailable, fallback heuristic: {e}")
+        warnings.warn(f"tiktoken unavailable, fallback heuristic: {e}", stacklevel=2)
         return HeuristicCounter()
 
 
@@ -66,5 +68,5 @@ def get_pricing(model: str) -> Pricing:
     out = float(os.environ.get("MODEL_PRICING_OUTPUT", "0") or "0")
     if inp > 0 or out > 0:
         return Pricing(model, inp, out)
-    warnings.warn(f"no pricing for model={model}; cost will be 0")
+    warnings.warn(f"no pricing for model={model}; cost will be 0", stacklevel=2)
     return Pricing(model, 0.0, 0.0)

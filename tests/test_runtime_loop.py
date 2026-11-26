@@ -1,6 +1,6 @@
 """Stage1 RED: 期望的 Agent Runtime API。先看失败，再实现。"""
-from agent.runtime.state import AgentState
 from agent.runtime.loop import run
+from agent.runtime.state import AgentState
 
 
 def test_state_defaults():

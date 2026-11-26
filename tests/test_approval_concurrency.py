@@ -225,15 +225,19 @@ def test_reclaim_respects_instance_ownership(store, connector):
 
 
 def test_tool_effect_pg_is_idempotent(connector):
-    """PG 占位：succeeded 回放不执行；failed 只允许一次重试（attempt=2）。"""
+    """PG 占位：succeeded 回放不执行；failed 只允许一次确认无副作用的重试。"""
     from security.tool_effect import (
-        CACHED, CONFLICT, EXECUTE, build_tool_effect_store,
+        CACHED,
+        CONFLICT,
+        EXECUTE,
+        build_tool_effect_store,
     )
 
     effects = build_tool_effect_store(connector)
     tenant = _tenant()
     ok_id = f"apr-eff-{uuid.uuid4().hex[:10]}"
     retry_id = f"apr-eff-{uuid.uuid4().hex[:10]}"
+    uncertain_id = f"apr-eff-{uuid.uuid4().hex[:10]}"
     try:
         d1 = effects.begin(tenant, ok_id, TOOL, {"sku": "A"})
         assert d1["decision"] == EXECUTE and d1["attempt"] == 1
@@ -252,13 +256,47 @@ def test_tool_effect_pg_is_idempotent(connector):
                             maybe_side_effect=True) is True
         r3 = effects.begin(tenant, retry_id, TOOL, {"sku": "B"})
         assert r3["decision"] == CONFLICT, r3
-        assert r3["reason"] == "retry budget exhausted", r3
+        assert r3["reason"] == "manual reconciliation required", r3
         row = effects.get(tenant, retry_id, TOOL, {"sku": "B"})
         assert row["status"] == "failed" and row["attempt"] == 2, row
         assert bool(row["maybe_side_effect"]) is True, row
+
+        assert effects.begin(tenant, uncertain_id, TOOL, {"sku": "C"})["decision"] == EXECUTE
+        assert effects.fail(tenant, uncertain_id, TOOL, {"sku": "C"},
+                            maybe_side_effect=True) is True
+        uncertain = effects.begin(tenant, uncertain_id, TOOL, {"sku": "C"})
+        assert uncertain["decision"] == CONFLICT, uncertain
+        assert uncertain["attempt"] == 1
+        assert uncertain["reason"] == "manual reconciliation required"
     finally:
         _cleanup(connector, approval_id=ok_id)
         _cleanup(connector, approval_id=retry_id)
+        _cleanup(connector, approval_id=uncertain_id)
+
+
+def test_concurrent_clean_retry_has_one_winner(connector):
+    from security.tool_effect import CONFLICT, EXECUTE, build_tool_effect_store
+
+    effects = build_tool_effect_store(connector)
+    tenant = _tenant()
+    aid = f"apr-eff-{uuid.uuid4().hex[:10]}"
+    args = {"sku": "race"}
+    try:
+        assert effects.begin(tenant, aid, TOOL, args)["decision"] == EXECUTE
+        assert effects.fail(tenant, aid, TOOL, args, maybe_side_effect=False)
+        barrier = threading.Barrier(8)
+
+        def retry(_):
+            barrier.wait()
+            return effects.begin(tenant, aid, TOOL, args)["decision"]
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            decisions = list(pool.map(retry, range(8)))
+        assert decisions.count(EXECUTE) == 1, decisions
+        assert decisions.count(CONFLICT) == 7, decisions
+        assert effects.get(tenant, aid, TOOL, args)["attempt"] == 2
+    finally:
+        _cleanup(connector, approval_id=aid)
 
 
 def test_stale_claim_token_cannot_write_terminal_state(store, connector):
@@ -312,8 +350,13 @@ def _age_effect(connector, approval_id: str) -> None:
 
 
 def test_stale_pg_effect_reclaimed_when_approval_inactive(store, connector):
-    """started + 过期 + approval 无活跃租约 → failed，可重试一次，第三次拒绝。"""
-    from security.tool_effect import CONFLICT, EXECUTE, STALE_STARTED_ERROR
+    """started + 过期 + approval 无活跃租约 → failed，必须人工对账，禁止重放。"""
+    from security.tool_effect import (
+        CONFLICT,
+        EXECUTE,
+        MANUAL_RECONCILIATION_ERROR,
+        STALE_STARTED_ERROR,
+    )
 
     effects = _effect_store(connector)
     tenant = _tenant()
@@ -332,9 +375,13 @@ def test_stale_pg_effect_reclaimed_when_approval_inactive(store, connector):
         assert store.get(aid)["status"] == "approved"
 
         retry = effects.begin(tenant, aid, TOOL, args)
-        assert retry["decision"] == EXECUTE and retry["attempt"] == 2, retry
-        assert effects.fail(tenant, aid, TOOL, args, maybe_side_effect=True) is True
+        assert retry["decision"] == CONFLICT, retry
+        assert retry["reason"] == MANUAL_RECONCILIATION_ERROR, retry
         assert effects.begin(tenant, aid, TOOL, args)["decision"] == CONFLICT
+        reconciliation = [row for row in effects.list_manual_reconciliation()
+                          if row["tenant_id"] == tenant]
+        assert [row["approval_id"] for row in reconciliation] == [aid]
+        assert reconciliation[0]["last_error"] == STALE_STARTED_ERROR
     finally:
         _cleanup(connector, approval_id=aid)
 
@@ -380,7 +427,6 @@ def test_stale_pg_reclaim_is_idempotent(store, connector):
 
 def test_stale_pg_view_lists_stuck_only(store, connector):
     """运维视图：列出无活跃租约的卡死行，不列出活跃执行行；不暴露明文。"""
-    from security.tool_effect import EXECUTE
 
     effects = _effect_store(connector)
     tenant = _tenant()

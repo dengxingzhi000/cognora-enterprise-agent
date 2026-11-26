@@ -9,11 +9,13 @@
 """
 from __future__ import annotations
 
+import builtins
 import json
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from infrastructure.pg.connector import OperationalError
+
 from .store import MemoryStore
 
 LAYER = "episodic"
@@ -84,13 +86,14 @@ class EpisodicMemoryStore:
             "tools": list(tools or []),
             "task_text": task_text,
             "summary": f"[{to_status}] {task_text[:120]}",
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
         }
         if self._has_connector():
             try:
+                assert self._store is not None
                 self._store.put(LAYER, tenant_id, body, permission=self.permission)
             except Exception as e:  # noqa: BLE001 - 记忆写入不能阻断主流程
-                warnings.warn(f"episodic record failed: {e}")
+                warnings.warn(f"episodic record failed: {e}", stacklevel=2)
         else:
             self._memory.append(body)
             if len(self._memory) > self.limit * 5:
@@ -118,7 +121,7 @@ class EpisodicMemoryStore:
                 task_text=task_text,
             )
         except Exception as e:  # noqa: BLE001
-            warnings.warn(f"episodic record_task_transition failed: {e}")
+            warnings.warn(f"episodic record_task_transition failed: {e}", stacklevel=2)
             return None
 
     # --- 读取 ---
@@ -126,6 +129,7 @@ class EpisodicMemoryStore:
         limit = limit or self.limit
         if self._has_connector():
             try:
+                assert self._store is not None
                 rows = self._store.query(LAYER, tenant_id, permission=self.permission,
                                          limit=limit)
             except OperationalError as e:
@@ -146,12 +150,12 @@ class EpisodicMemoryStore:
         return [dict(b) for b in self._memory if b.get("tenant_id") == tenant_id][:limit]
 
     def recall(self, tenant_id: str, query: str, task_type: str | None = None,
-               tools: list[str] | None = None, top_k: int = 3) -> list[dict]:
+               tools: builtins.list[str] | None = None, top_k: int = 3) -> builtins.list[dict]:
         if not query or not query.strip():
             return []
         wanted_type = task_type or infer_task_type(query)
         wanted_tools = {t for t in (tools or []) if t}
-        scored: list[tuple[float, dict]] = []
+        scored: builtins.list[tuple[float, dict]] = []
         for body in self.list(tenant_id, limit=self.limit):
             text = " ".join(str(body.get(k, "")) for k in ("task_text", "reason", "summary"))
             text += " " + " ".join(body.get("tools") or [])
@@ -191,5 +195,5 @@ def record_task_transition(task, reason: str = "") -> dict | None:
     try:
         return get_episodic_store().record_task_transition(task, reason)
     except Exception as e:  # noqa: BLE001
-        warnings.warn(f"episodic default store unavailable: {e}")
+        warnings.warn(f"episodic default store unavailable: {e}", stacklevel=2)
         return None

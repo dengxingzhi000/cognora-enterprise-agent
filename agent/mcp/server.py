@@ -32,30 +32,6 @@ class MCPToolSpec:
 
 TOOL_NAMES = ("metrics.get", "logs.search", "git.diff")
 
-_INPUT_SCHEMAS: dict[str, dict] = {
-    "metrics.get": {
-        "type": "object",
-        "properties": {
-            "service": {"type": "string", "description": "服务名，默认 order"},
-            "tenant_id": {"type": "string", "description": "租户 id"},
-        },
-    },
-    "logs.search": {
-        "type": "object",
-        "properties": {
-            "keyword": {"type": "string", "description": "日志关键词，默认 5xx"},
-            "query": {"type": "string", "description": "自然语言查询（兼容 Registry 调用）"},
-            "tenant_id": {"type": "string", "description": "租户 id"},
-        },
-    },
-    "git.diff": {
-        "type": "object",
-        "properties": {
-            "repo": {"type": "string", "description": "仓库路径（可选）"},
-        },
-    },
-}
-
 
 def _load_server_class():
     """mcp 1.x 用 FastMCP；mcp 2.x 改名为 MCPServer，二者 tool() 形状一致。"""
@@ -76,13 +52,16 @@ def mcp_available() -> bool:
 
 
 def build_tool_specs(registry=None) -> list[MCPToolSpec]:
-    """按 Registry 实际工具生成 MCP 描述；缺失项跳过而不是伪造。"""
+    """按 Registry 的 StructuredTool schema 生成 MCP 描述。"""
+    from langchain_core.utils.function_calling import convert_to_openai_tool
+
     reg = registry or build_default_registry()
     specs: list[MCPToolSpec] = []
     for name in TOOL_NAMES:
         tool = reg.get(name)
+        schema = convert_to_openai_tool(tool.structured_tool)["function"]["parameters"]
         specs.append(MCPToolSpec(name=name, description=tool.description,
-                                 input_schema=_INPUT_SCHEMAS[name]))
+                                 input_schema=schema))
     return specs
 
 

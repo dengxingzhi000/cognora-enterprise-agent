@@ -46,9 +46,16 @@ def test_retrieval_ranks_relevant_first():
     assert "5000" in hits[0].text
 
 
-def test_knowledge_search_tool_exists():
+def test_knowledge_search_tool_exists(monkeypatch):
     from agent.tools.builtin import build_default_registry
+    from knowledge import service as service_module
+
+    store = KnowledgeStore()
+    store.add_many(ingest(_doc("报销超过5000需财务审批", permission="finance")))
+    monkeypatch.setattr(service_module, "_service", service_module.KnowledgeService(store=store, seed=False))
     reg = build_default_registry()
     assert "knowledge.search" in reg.list_tools()
-    out = reg.call("knowledge.search", {"query": "报销5000", "tenant_id": "t1"})
+    out = reg.call("knowledge.search", {
+        "query": "报销5000", "tenant_id": "t1", "allowed_permissions": ["finance"],
+    })
     assert "5000" in str(out)

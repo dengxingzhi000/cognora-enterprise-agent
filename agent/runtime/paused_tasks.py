@@ -31,8 +31,8 @@ def _state_to_payload(state) -> dict:
 
 
 def _payload_to_state(payload: dict):
-    from agent.runtime.state import AgentState
     from agent.runtime.agent_task import AgentTask
+    from agent.runtime.state import AgentState
 
     state = AgentState(
         task=payload.get("task", ""),
@@ -150,5 +150,5 @@ def build_paused_task_store(dsn: str | None = None, connector=None) -> PausedTas
     try:
         return PausedTaskStore(PostgresPausedTaskRepository(connector))
     except Exception as e:  # noqa: BLE001
-        warnings.warn(f"paused-task PG repo init failed ({e}); using in-memory")
+        warnings.warn(f"paused-task PG repo init failed ({e}); using in-memory", stacklevel=2)
         return PausedTaskStore(InMemoryPausedTaskRepository())

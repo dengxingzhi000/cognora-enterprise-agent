@@ -1,5 +1,4 @@
 """Batch 2: 审批单与挂起任务持久化（InMemory 默认 / Postgres 可选）。"""
-import pytest
 
 
 def test_approval_store_inmemory_repository_roundtrip():
@@ -19,7 +18,7 @@ def test_approval_store_inmemory_repository_roundtrip():
 def test_build_approval_store_falls_back_without_dsn(monkeypatch):
     for name in ("AGENT_PG_DSN", "PG_DSN", "POSTGRES_DSN", "AGENT_PG_OFFLINE", "PG_OFFLINE"):
         monkeypatch.delenv(name, raising=False)
-    from security.approval import build_approval_store, InMemoryApprovalRepository
+    from security.approval import InMemoryApprovalRepository, build_approval_store
     store = build_approval_store()
     assert isinstance(store._repo, InMemoryApprovalRepository)
 
@@ -27,7 +26,7 @@ def test_build_approval_store_falls_back_without_dsn(monkeypatch):
 def test_build_paused_store_falls_back_without_dsn(monkeypatch):
     for name in ("AGENT_PG_DSN", "PG_DSN", "POSTGRES_DSN", "AGENT_PG_OFFLINE", "PG_OFFLINE"):
         monkeypatch.delenv(name, raising=False)
-    from agent.runtime.paused_tasks import build_paused_task_store, InMemoryPausedTaskRepository
+    from agent.runtime.paused_tasks import InMemoryPausedTaskRepository, build_paused_task_store
     store = build_paused_task_store()
     assert isinstance(store._repo, InMemoryPausedTaskRepository)
 
@@ -37,8 +36,8 @@ def test_pg_dsn_alone_does_not_activate_agent_persistence(monkeypatch):
     monkeypatch.delenv("AGENT_PG_DSN", raising=False)
     monkeypatch.delenv("AGENT_PG_OFFLINE", raising=False)
     monkeypatch.setenv("PG_DSN", "postgresql://unused:unused@127.0.0.1:1/nope")
-    from security.approval import build_approval_store, InMemoryApprovalRepository
-    from agent.runtime.paused_tasks import build_paused_task_store, InMemoryPausedTaskRepository
+    from agent.runtime.paused_tasks import InMemoryPausedTaskRepository, build_paused_task_store
+    from security.approval import InMemoryApprovalRepository, build_approval_store
     assert isinstance(build_approval_store()._repo, InMemoryApprovalRepository)
     assert isinstance(build_paused_task_store()._repo, InMemoryPausedTaskRepository)
 
@@ -54,8 +53,8 @@ def test_episodic_default_ignores_legacy_pg_dsn(monkeypatch):
 
 
 def _paused_state(task_id="task-p1", tenant="t1"):
-    from agent.runtime.state import AgentState
     from agent.runtime.agent_task import AgentTask
+    from agent.runtime.state import AgentState
 
     state = AgentState(task="采购下单需要审批", task_id=task_id)
     state.context["tenant_id"] = tenant
@@ -107,10 +106,11 @@ def test_paused_task_store_is_tenant_scoped():
 def test_chat_resume_path_uses_persistent_store(monkeypatch):
     """公开 API 仍走同一路径；rebuild store 后（模拟进程重启）仍能恢复。"""
     from fastapi.testclient import TestClient
+
     import apps.api.main as main_mod
+    from agent.runtime.paused_tasks import PausedTaskStore
     from infrastructure.pg import connector as conn_mod
     from infrastructure.pg import schema as schema_mod
-    from agent.runtime.paused_tasks import PausedTaskStore
 
     monkeypatch.setattr(conn_mod, "get_connector", lambda: None)
     monkeypatch.setattr(schema_mod, "ensure_schema", lambda c: None)

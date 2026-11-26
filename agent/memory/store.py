@@ -86,7 +86,7 @@ class MemoryStore:
                 (tenant_id, department, permission, version, json.dumps(body)),
             )
         except OperationalError as e:
-            warnings.warn(f"memory put outage layer={layer}: {e}")
+            warnings.warn(f"memory put outage layer={layer}: {e}", stacklevel=2)
 
     def query(self, layer: str, tenant_id: str, permission: str = "public",
               department: str | None = None, limit: int = 10) -> list[dict]:

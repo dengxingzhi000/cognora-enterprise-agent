@@ -1,6 +1,5 @@
 """AgentState: 整个 Runtime 唯一真相来源。"""
 from dataclasses import dataclass, field
-from typing import Any
 
 
 @dataclass

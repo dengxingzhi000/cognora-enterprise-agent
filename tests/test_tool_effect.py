@@ -9,7 +9,6 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from apps.api.main import app
 from security.approval import ApprovalStore, InMemoryApprovalRepository
 from security.tool_effect import (
     CACHED,
@@ -66,9 +65,9 @@ def _prepare(monkeypatch):
     """把 main 的全局仓储换成全新的 InMemory 实现。"""
     import agent.tools.executor as executor_module
     import apps.api.main as main
+    from agent.runtime.paused_tasks import PausedTaskStore
     from infrastructure.pg import connector as connector_module
     from infrastructure.pg import schema as schema_module
-    from agent.runtime.paused_tasks import PausedTaskStore
 
     monkeypatch.setattr(connector_module, "get_connector", lambda: None)
     monkeypatch.setattr(schema_module, "ensure_schema", lambda c: None)
@@ -181,7 +180,7 @@ def test_failed_effect_allows_one_retry_then_refuses():
 
     third = store.begin(tenant, aid, TOOL, args)
     assert third["decision"] == CONFLICT, third
-    assert third["reason"] == "retry budget exhausted", third
+    assert third["reason"] == "manual reconciliation required", third
     row = store.get(tenant, aid, TOOL, args)
     assert row["status"] == "failed" and row["attempt"] == 2, row
     assert row["maybe_side_effect"] is True, row
@@ -239,8 +238,8 @@ def _stuck_setup(*, active_lease: int | None = None):
     return approvals, effects, aid
 
 
-def test_stale_started_effect_reclaimed_then_one_retry_is_allowed():
-    from security.tool_effect import STALE_STARTED_ERROR
+def test_stale_started_effect_reclaimed_then_requires_reconciliation():
+    from security.tool_effect import MANUAL_RECONCILIATION_ERROR, STALE_STARTED_ERROR
 
     approvals, effects, aid = _stuck_setup()
     assert effects.reclaim_stale_started(stale_seconds=5, approvals=approvals) == 1
@@ -252,11 +251,8 @@ def test_stale_started_effect_reclaimed_then_one_retry_is_allowed():
     assert approvals.get(aid)["status"] == "approved"
 
     retry = effects.begin("t1", aid, TOOL, {"sku": "X"})
-    assert retry["decision"] == EXECUTE and retry["attempt"] == 2, retry
-    assert effects.fail("t1", aid, TOOL, {"sku": "X"}, maybe_side_effect=True) is True
-    third = effects.begin("t1", aid, TOOL, {"sku": "X"})
-    assert third["decision"] == CONFLICT
-    assert third["reason"] == "retry budget exhausted", third
+    assert retry["decision"] == CONFLICT, retry
+    assert retry["reason"] == MANUAL_RECONCILIATION_ERROR, retry
 
 
 def test_stale_started_effect_is_not_reclaimed_while_approval_lease_is_live():
@@ -271,9 +267,10 @@ def test_stale_started_effect_is_not_reclaimed_while_approval_lease_is_live():
 
 
 def test_stale_reclaim_is_idempotent_and_counts_once():
-    from observability import metrics
+    from prometheus_client import CollectorRegistry
 
-    backend = metrics.configure_metrics(memory=True)
+    from observability import metrics
+    backend = metrics.configure_metrics(registry=CollectorRegistry())
     try:
         approvals, effects, aid = _stuck_setup()
         assert effects.reclaim_stale_started(stale_seconds=5, approvals=approvals) == 1
@@ -301,8 +298,63 @@ def test_stale_view_lists_stuck_row_but_not_active_row():
     assert "args" not in rows[0] and "result_ref" not in rows[0]
 
 
-def test_stale_reclaim_then_retry_really_executes(monkeypatch):
-    """崩溃 → stale 回收 → 重试真的调用工具：invoked 1 → 2，第三次 409。"""
+def test_resume_denied_outcome_fails_closed_without_effect(monkeypatch):
+    import apps.api.main as main
+
+    client, approvals, effects, registry = _prepare(monkeypatch)
+    tenant, task_id = _pause_and_approve(client)
+    aid = _last_aid(approvals, tenant)
+
+    class DenyPolicy:
+        def check(self, user, tool, args):
+            return {"decision": "deny"}
+
+    monkeypatch.setattr(main, "PolicyEngine", DenyPolicy)
+    resumed = client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
+
+    assert resumed.status_code == 502, resumed.text
+    assert registry.calls == 0
+    assert approvals.get(aid)["status"] == "approved"
+    effect = effects.get(tenant, aid, TOOL, approvals.get(aid)["args"])
+    assert effect["status"] == "failed"
+    assert effect["maybe_side_effect"] is False
+
+
+def test_clean_unknown_tool_failure_can_be_retried_after_fix(monkeypatch):
+    import agent.tools.executor as executor_module
+    from agent.tools.registry import Registry, Tool
+
+    client, approvals, effects, registry = _prepare(monkeypatch)
+    tenant, task_id = _pause_and_approve(client)
+    aid = _last_aid(approvals, tenant)
+    empty = Registry()
+    monkeypatch.setattr(executor_module, "_default_registry", empty)
+
+    first = client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
+    assert first.status_code == 502, first.text
+    assert approvals.get(aid)["status"] == "approved"
+    effect = effects.get(tenant, aid, TOOL, approvals.get(aid)["args"])
+    assert effect["status"] == "failed" and effect["maybe_side_effect"] is False
+
+    empty.register(Tool(TOOL, "fixed", lambda args: "ok"))
+    second = client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
+    assert second.status_code == 200, second.text
+    assert second.json()["executed"] is True
+    assert approvals.get(aid)["status"] == "done"
+
+
+def test_manual_reconciliation_view_includes_reclaimed_effect():
+    approvals, effects, aid = _stuck_setup()
+    assert effects.reclaim_stale_started(stale_seconds=5, approvals=approvals) == 1
+
+    rows = effects.list_manual_reconciliation(approvals=approvals)
+    assert [row["approval_id"] for row in rows] == [aid]
+    assert rows[0]["maybe_side_effect"] is True
+    assert rows[0]["last_error"] == "stale started effect reclaimed"
+
+
+def test_stale_reclaim_then_resume_refuses_to_replay(monkeypatch):
+    """崩溃 → stale 回收 → resume 转为人工对账，工具绝不重放。"""
     client, approvals, effects, registry = _prepare(monkeypatch)
     monkeypatch.setenv("AGENT_TOOL_EFFECT_STALE_SECONDS", "1")
     monkeypatch.setenv("AGENT_APPROVAL_LEASE_SECONDS", "1")
@@ -321,15 +373,12 @@ def test_stale_reclaim_then_retry_really_executes(monkeypatch):
     row = effects.get(tenant, aid, TOOL, args)
     assert row["status"] == "started", row
 
-    time.sleep(1.4)  # 审批租约与 stale 窗口都过期
+    time.sleep(1.4)
 
-    # 第二次：回收 approval + 回收 stale effect，重试确实执行（invoked=2）。
-    with pytest.raises(RuntimeError):
-        client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
-    assert registry.calls == 2, "stale reclaim must allow a real retry"
+    resumed = client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
+    assert resumed.status_code == 409, resumed.text
+    assert resumed.json()["detail"] == "manual reconciliation required"
+    assert registry.calls == 1, "an uncertain write must never be replayed"
     row = effects.get(tenant, aid, TOOL, args)
-    assert row["status"] == "started" and row["attempt"] == 2, row
-
-    third = client.post(f"/chat/{task_id}/resume", json={"tenant_id": tenant})
-    assert third.status_code == 409, third.text
-    assert registry.calls == 2
+    assert row["status"] == "failed" and row["maybe_side_effect"] is True, row
+    assert approvals.get(aid)["status"] == "failed"

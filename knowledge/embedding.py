@@ -53,6 +53,36 @@ class HashingEmbeddingProvider(EmbeddingProvider):
         return vec
 
 
+class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
+    """Optional semantic embeddings from an OpenAI-compatible endpoint."""
+
+    def __init__(self, model: str, base_url: str, api_key: str, dim: int = 256):
+        if not api_key:
+            raise ValueError("RAG_EMBEDDING_API_KEY is required for openai embeddings")
+        if dim <= 0:
+            raise ValueError("dim must be > 0")
+        self.dim = dim
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        if not self.base_url.endswith("/v1"):
+            self.base_url += "/v1"
+        self._api_key = api_key
+
+    def embed(self, text: str) -> list[float]:
+        import httpx
+
+        response = httpx.post(
+            self.base_url + "/embeddings",
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            json={"model": self.model, "input": text},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = sorted(response.json()["data"], key=lambda item: item["index"])
+        vector = [float(value) for value in data[0]["embedding"]]
+        return (vector + [0.0] * self.dim)[:self.dim]
+
+
 def get_embedding_provider(name: str | None = None, dim: int = 256) -> EmbeddingProvider:
     import os
     import warnings
@@ -60,5 +90,15 @@ def get_embedding_provider(name: str | None = None, dim: int = 256) -> Embedding
     name = name or os.environ.get("RAG_EMBEDDING_PROVIDER", "hashing")
     if name in ("hashing", "local", "default"):
         return HashingEmbeddingProvider(dim=dim)
-    warnings.warn(f"unknown RAG_EMBEDDING_PROVIDER={name}; falling back to hashing")
+    if name in ("openai", "openai-compatible"):
+        try:
+            return OpenAICompatibleEmbeddingProvider(
+                model=os.getenv("RAG_EMBEDDING_MODEL", "text-embedding-3-small"),
+                base_url=os.getenv("RAG_EMBEDDING_BASE_URL", os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")),
+                api_key=os.getenv("RAG_EMBEDDING_API_KEY", os.getenv("DEEPSEEK_API_KEY", "")),
+                dim=int(os.getenv("RAG_EMBEDDING_DIM", str(dim))),
+            )
+        except Exception as exc:
+            raise ValueError(f"semantic embedding configuration invalid: {type(exc).__name__}") from exc
+    warnings.warn(f"unknown RAG_EMBEDDING_PROVIDER={name}; falling back to hashing", stacklevel=2)
     return HashingEmbeddingProvider(dim=dim)

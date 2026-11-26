@@ -1,7 +1,7 @@
 """AgentTask 包装层 + 状态机 + history。"""
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .state import AgentState
 from .status import ALLOWED_TRANSITIONS
@@ -18,7 +18,7 @@ class InvalidTransition(AgentTaskError):
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @dataclass
@@ -35,9 +35,12 @@ class AgentTask:
     history: list[dict] = field(default_factory=list)
 
     @classmethod
-    def from_state(cls, state: AgentState, tenant_id: str = "default") -> "AgentTask":
+    def from_state(cls, state: AgentState, tenant_id: str | None = None) -> "AgentTask":
         tid = getattr(state, "task_id", None) or str(uuid.uuid4())
-        return cls(task_id=tid, tenant_id=tenant_id, state=state)
+        context = getattr(state, "context", {}) or {}
+        user = context.get("user") or {}
+        resolved_tenant = tenant_id or context.get("tenant_id") or user.get("tenant_id") or "default"
+        return cls(task_id=tid, tenant_id=resolved_tenant, state=state)
 
     def transition(self, to: str, reason: str = "") -> None:
         allowed = ALLOWED_TRANSITIONS.get(self.status, set())

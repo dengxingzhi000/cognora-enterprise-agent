@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 import warnings
+from abc import ABC, abstractmethod
 from itertools import count
 
 logger = logging.getLogger(__name__)
@@ -95,21 +96,53 @@ class ApprovalConflict(ValueError):
     """并发下审批状态已被其他请求改写；调用方应按 409 处理。"""
 
 
-class ApprovalRepository:
-    def create(self, user: dict, tool: str, args: dict) -> str: ...
-    def get(self, approval_id: str) -> dict: ...
-    def approve(self, approval_id: str, approver: str) -> dict: ...
-    def reject(self, approval_id: str, approver: str) -> dict: ...
+class ApprovalRepository(ABC):
+    @abstractmethod
+    def create(self, user: dict, tool: str, args: dict) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get(self, approval_id: str) -> dict:
+        raise NotImplementedError
+
+    @abstractmethod
+    def approve(self, approval_id: str, approver: str) -> dict:
+        raise NotImplementedError
+
+    @abstractmethod
+    def reject(self, approval_id: str, approver: str) -> dict:
+        raise NotImplementedError
+
+    @abstractmethod
     def claim(self, approval_id: str, lease_seconds: int | None = None,
-              claimed_by: str | None = None) -> dict: ...
+              claimed_by: str | None = None) -> dict:
+        raise NotImplementedError
+
+    @abstractmethod
     def renew(self, approval_id: str, claim_token: str,
               lease_seconds: int | None = None,
-              claimed_by: str | None = None) -> bool: ...
-    def complete(self, approval_id: str, claim_token: str) -> dict: ...
-    def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict: ...
-    def release(self, approval_id: str, claim_token: str) -> bool: ...
-    def reclaim_expired_claims(self, claimed_by: str | None = None) -> int: ...
-    def list_items(self) -> list[dict]: ...
+              claimed_by: str | None = None) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def complete(self, approval_id: str, claim_token: str) -> dict:
+        raise NotImplementedError
+
+    @abstractmethod
+    def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict:
+        raise NotImplementedError
+
+    @abstractmethod
+    def release(self, approval_id: str, claim_token: str) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def reclaim_expired_claims(self, claimed_by: str | None = None) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_items(self) -> list[dict]:
+        raise NotImplementedError
 
 
 class InMemoryApprovalRepository(ApprovalRepository):
@@ -188,7 +221,8 @@ class InMemoryApprovalRepository(ApprovalRepository):
     def complete(self, approval_id: str, claim_token: str) -> dict:
         with self._lock:
             item = self._items[approval_id]
-            if item["status"] != "in_progress" or item.get("claim_token") != claim_token:
+            if (item["status"] != "in_progress" or item.get("claim_token") != claim_token
+                    or (item.get("lease_until") or 0) <= time.monotonic()):
                 raise ValueError(
                     f"approval {approval_id} is {item['status']}, not held by this claim")
             item["status"] = "done"
@@ -199,7 +233,8 @@ class InMemoryApprovalRepository(ApprovalRepository):
     def fail(self, approval_id: str, claim_token: str, last_error: str) -> dict:
         with self._lock:
             item = self._items[approval_id]
-            if item["status"] != "in_progress" or item.get("claim_token") != claim_token:
+            if (item["status"] != "in_progress" or item.get("claim_token") != claim_token
+                    or (item.get("lease_until") or 0) <= time.monotonic()):
                 raise ValueError(
                     f"approval {approval_id} is {item['status']}, not held by this claim")
             item["status"] = "failed"
@@ -211,7 +246,8 @@ class InMemoryApprovalRepository(ApprovalRepository):
         with self._lock:
             item = self._items.get(approval_id)
             if (item is None or item["status"] != "in_progress"
-                    or item.get("claim_token") != claim_token):
+                    or item.get("claim_token") != claim_token
+                    or (item.get("lease_until") or 0) <= time.monotonic()):
                 return False
             item["status"] = "approved"
             item["claimed_at"] = None
@@ -357,7 +393,7 @@ class PostgresApprovalRepository(ApprovalRepository):
             "UPDATE agent_approval SET consumed = TRUE, consumed_at = now(), "
             "status = 'done', updated_at = now() "
             "WHERE id = ? AND status = 'in_progress' AND consumed = FALSE "
-            "AND claim_token = ?",
+            "AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > now()",
             (approval_id, claim_token),
         )
         if updated:
@@ -371,7 +407,7 @@ class PostgresApprovalRepository(ApprovalRepository):
         updated = self._c.execute_rowcount(
             "UPDATE agent_approval SET status = 'failed', last_error = ?, "
             "updated_at = now() WHERE id = ? AND status = 'in_progress' "
-            "AND claim_token = ?",
+            "AND claim_token = ? AND lease_until IS NOT NULL AND lease_until > now()",
             (summary, approval_id, claim_token),
         )
         if updated:
@@ -385,7 +421,8 @@ class PostgresApprovalRepository(ApprovalRepository):
         updated = self._c.execute_rowcount(
             "UPDATE agent_approval SET status = 'approved', claimed_at = NULL, "
             "lease_until = NULL, claim_token = NULL, claimed_by = NULL, updated_at = now() "
-            "WHERE id = ? AND status = 'in_progress' AND claim_token = ?",
+            "WHERE id = ? AND status = 'in_progress' AND claim_token = ? "
+            "AND lease_until IS NOT NULL AND lease_until > now()",
             (approval_id, claim_token),
         )
         return bool(updated)
@@ -487,7 +524,7 @@ class LeaseHeartbeat:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def start(self) -> "LeaseHeartbeat":
+    def start(self) -> LeaseHeartbeat:
         self._thread = threading.Thread(
             target=self._run, name=f"approval-heartbeat-{self._id}", daemon=True)
         self._thread.start()
@@ -547,5 +584,5 @@ def build_approval_store(dsn: str | None = None, connector=None) -> ApprovalStor
     try:
         return ApprovalStore(PostgresApprovalRepository(connector))
     except Exception as e:  # noqa: BLE001
-        warnings.warn(f"approval PG repo init failed ({e}); using in-memory")
+        warnings.warn(f"approval PG repo init failed ({e}); using in-memory", stacklevel=2)
         return ApprovalStore(InMemoryApprovalRepository())

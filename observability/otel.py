@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -33,31 +34,34 @@ class OtelTraceAdapter:
         source = tracer_provider or trace_api
         self._tracer = source.get_tracer("enterprise-agent")
         self._provider = tracer_provider
-        self._spans: dict[str, object] = {}
+        self._spans: dict[str, tuple[Any, Any]] = {}
 
     def start_trace(self, trace_id: str, task: str):
-        span = self._tracer.start_as_current_span("agent.task")
+        scope = self._tracer.start_as_current_span("agent.task")
+        span = scope.__enter__()
         span.set_attribute("agent.task", task or "")
         span.set_attribute("agent.trace_id", trace_id)
-        self._spans[trace_id] = span
+        self._spans[trace_id] = (scope, span)
         return span
 
     def log_event(self, trace_id: str, stage: str, data: dict) -> None:
-        span = self._spans.get(trace_id)
-        if span is None:
+        entry = self._spans.get(trace_id)
+        if entry is None:
             return
+        _, span = entry
         attrs = {f"agent.{k}": str(v) for k, v in (data or {}).items()}
         span.add_event(stage or "event", attrs)
 
     def end_trace(self, trace_id: str, status: str = "done") -> None:
-        span = self._spans.pop(trace_id, None)
-        if span is None:
+        entry = self._spans.pop(trace_id, None)
+        if entry is None:
             return
+        scope, span = entry
         status_code = self._trace.StatusCode.ERROR if status in ("failed", "error") \
             else self._trace.StatusCode.OK
         span.set_status(self._trace.Status(status_code, status))
         span.set_attribute("agent.status", status)
-        span.end()
+        scope.__exit__(None, None, None)
 
     def shutdown(self) -> None:
         if self._provider is not None and hasattr(self._provider, "shutdown"):

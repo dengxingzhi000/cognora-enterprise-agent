@@ -48,7 +48,7 @@ def test_analyze_sales_from_fixture_returns_structured_report():
     types = {f["type"] for f in out["findings"]}
     assert "gmv_drop" in types
     assert "payment_failure" in types
-    assert "metrics.get" in out["trace"]
+    assert any(item.startswith("metrics.get") for item in out["trace"])
     assert "knowledge.search" in out["trace"]
     assert "报告" in out["report"]
     assert out["recommendation"]

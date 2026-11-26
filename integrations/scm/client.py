@@ -1,14 +1,17 @@
-"""SCM HTTP封装：5s超时 / 401刷token重试1次 / 5xx/连接错重试1次 / 结果截断调用方做。"""
+"""SCM HTTP wrapper with delegated identity or standalone shared-account mode."""
 import contextvars
 import os
 import time as _time
 import uuid
+from typing import Any
 
 import httpx
 
+from observability.trace_context import current_traceparent
 from observability.tracing import Tracer
 
 from .auth import TokenCache
+from .context import current_scm_context
 
 scm_trace_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "scm_trace_id", default=None
@@ -28,11 +31,28 @@ class ScmClient:
 
     def _send(self, method: str, path: str, **kw):
         url = self.gateway_url.rstrip("/") + path
-        headers = kw.pop("headers", {})
-        token = self._tokens.get()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        headers = dict(kw.pop("headers", {}) or {})
+        identity = current_scm_context()
+        if identity is not None:
+            if not identity.platform_token:
+                return (401, {
+                    "code": "SCM_AUTHENTICATION_FAILED",
+                    "error": "delegated platform token is missing",
+                })
+            headers["Authorization"] = f"Bearer {identity.platform_token}"
+            headers["X-Tenant-Id"] = identity.tenant_id
+            if identity.device_id:
+                headers["X-Device-ID"] = identity.device_id
+            if identity.idempotency_key:
+                headers["Idempotency-Key"] = identity.idempotency_key
+        else:
+            token = self._tokens.get()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
         headers.setdefault("X-Request-Id", str(uuid.uuid4()))
+        traceparent = current_traceparent()
+        if traceparent:
+            headers.setdefault("traceparent", traceparent)
         tid = scm_trace_id.get()
         if tid and Tracer._shared is not None:
             try:
@@ -68,15 +88,26 @@ class ScmClient:
         except Exception:
             pass
 
-    def get(self, path: str, params: dict | None = None):
+    def get(self, path: str, params: dict | None = None, headers: dict | None = None):
+        return self._request("GET", path, params=params, headers=headers)
+
+    def post(self, path: str, json: dict | None = None, params: dict | None = None,
+             headers: dict | None = None):
+        return self._request("POST", path, params=params, json=json, headers=headers)
+
+    def _request(self, method: str, path: str, *, params: dict | None = None,
+                 json: dict | None = None, headers: dict | None = None):
         params = params or {}
+        kwargs: dict[str, Any] = {"params": params, "headers": dict(headers or {})}
+        if method == "POST":
+            kwargs["json"] = json
         try:
-            code, body = self._send("GET", path, params=params)
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            code, body = self._send(method, path, **kwargs)
+        except (httpx.ConnectError, httpx.TimeoutException):
             if self.backoff_seconds > 0:
                 _time.sleep(self.backoff_seconds)
             try:
-                code, body = self._send("GET", path, params=params)
+                code, body = self._send(method, path, **kwargs)
             except (httpx.ConnectError, httpx.TimeoutException) as e2:
                 return (0, {"error": f"transport after retry: {e2}", "path": path})
             return (code, body)
@@ -84,14 +115,19 @@ class ScmClient:
         if 500 <= code < 600:
             if self.backoff_seconds > 0:
                 _time.sleep(self.backoff_seconds)
-            code, body = self._send("GET", path, params=params)
+            code, body = self._send(method, path, **kwargs)
             if code == 0 or 500 <= code < 600:
                 return (0, {"error": f"5xx after retry: {code}", "path": path})
 
         if code == 401:
+            if current_scm_context() is not None:
+                return (401, {
+                    "code": "SCM_AUTHENTICATION_FAILED",
+                    "error": "delegated SCM authentication failed",
+                })
             self._login()
             try:
-                code, body = self._send("GET", path, params=params)
+                code, body = self._send(method, path, **kwargs)
             except (httpx.ConnectError, httpx.TimeoutException) as e2:
                 return (0, {"error": f"transport after 401-retry: {e2}", "path": path})
         return (code, body)

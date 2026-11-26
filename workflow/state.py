@@ -1,5 +1,5 @@
 """Workflow状态：纯dict，保证可序列化、可追踪。"""
-from typing import TypedDict, Any
+from typing import TypedDict
 
 
 class WorkflowState(TypedDict, total=False):

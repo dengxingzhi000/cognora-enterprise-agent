@@ -2,13 +2,31 @@
 import pytest
 
 
-def test_metrics_falls_back_to_memory_without_prometheus_client(monkeypatch):
-    """无 prometheus-client 时仍计数，并通过 /metrics 以文本暴露（不再 503）。"""
+def test_redaction_covers_camel_case_secret_fields():
+    from observability.redaction import redact
+
+    payload = {
+        "clientSecret": "client-value",
+        "apiKey": "key-value",
+        "accessToken": "token-value",
+        "nested": {"dbPassword": "password-value", "safe": "visible"},
+    }
+    assert redact(payload) == {
+        "clientSecret": "[REDACTED]",
+        "apiKey": "[REDACTED]",
+        "accessToken": "[REDACTED]",
+        "nested": {"dbPassword": "[REDACTED]", "safe": "visible"},
+    }
+
+
+def test_metrics_uses_official_prometheus_registry():
+    from prometheus_client import CollectorRegistry
+
     from observability import metrics
 
-    backend = metrics.configure_metrics(memory=True)
+    backend = metrics.configure_metrics(registry=CollectorRegistry())
     try:
-        assert metrics.metrics_available() is False
+        assert metrics.metrics_available() is True
         metrics.inc_task_status("done")
         metrics.inc_approval_reclaimed()
         metrics.inc_approval_lease_lost()
@@ -23,6 +41,7 @@ def test_metrics_falls_back_to_memory_without_prometheus_client(monkeypatch):
         assert backend.value("approval_reclaimed_total") == 1
 
         from fastapi.testclient import TestClient
+
         from apps.api.main import app
         client = TestClient(app)
         r = client.get("/metrics")
@@ -48,6 +67,7 @@ def test_metrics_renders_when_prometheus_client_available():
     assert "text/plain" in content_type
 
     from fastapi.testclient import TestClient
+
     from apps.api.main import app
     client = TestClient(app)
     r = client.get("/metrics")
@@ -55,10 +75,12 @@ def test_metrics_renders_when_prometheus_client_available():
     assert "agent_task_total" in r.text
 
 
-def test_metrics_recording_still_counts_on_memory_backend():
+def test_metrics_recording_uses_isolated_official_registry():
+    from prometheus_client import CollectorRegistry
+
     from observability import metrics
 
-    backend = metrics.configure_metrics(memory=True)
+    backend = metrics.configure_metrics(registry=CollectorRegistry())
     try:
         metrics.inc_task_status("failed")
         metrics.record_tool_call("unknown", False)
@@ -77,6 +99,17 @@ class _FakeSpan:
         self.events = []
         self.status = None
         self.ended = False
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.exited = True
+        self.ended = True
+        return False
 
     def set_attribute(self, key, value):
         self.attributes[key] = value
@@ -144,12 +177,15 @@ def test_otel_adapter_maps_events_and_status():
         assert span.events[0][1]["agent.tool"] == "metrics.get"
         assert span.status.code == "ERROR"
         assert span.ended is True
+        assert span.entered is True
+        assert span.exited is True
     finally:
         Tracer.otel = None
 
 
 def test_build_otel_adapter_exporter_paths(monkeypatch, caplog):
     import logging
+
     import observability.otel as otel
 
     caplog.set_level(logging.INFO)
@@ -237,6 +273,26 @@ def test_protocol_override_and_invalid_fallback(monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "invalid")
     assert otel._protocol_for("http://127.0.0.1:4317") == "grpc"
     assert otel._protocol_for("http://127.0.0.1:4318") == "http"
+
+
+def test_trace_ids_are_unique_across_tracer_instances():
+    from observability.tracing import Tracer
+
+    first = Tracer().start_trace("one")
+    second = Tracer().start_trace("two")
+    assert first != second
+
+
+def test_default_metrics_registry_includes_standard_collectors():
+    from observability import metrics
+
+    metrics.reset_metrics()
+    try:
+        payload, _ = metrics.render_metrics()
+        assert b"python_gc_objects_collected_total" in payload
+        assert b"python_info" in payload
+    finally:
+        metrics.reset_metrics()
 
 
 def test_tracer_keeps_memory_trace_without_otel():

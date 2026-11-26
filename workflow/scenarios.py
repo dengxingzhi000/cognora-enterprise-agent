@@ -7,6 +7,7 @@
 """
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -58,9 +59,12 @@ def review_contract(contract: dict | str | None, tenant_id: str = "t1") -> dict:
         clauses = [str(clauses)]
     supplier_id = data.get("supplier_id", "")
 
-    from knowledge.seed import get_default_store
-    hits = get_default_store().search("合同审批 赔偿 预付款", tenant_id=tenant_id,
-                                      allowed_permissions=["employee", "finance", "manager", "admin"])
+    from integrations.scm.context import current_scm_context
+    from knowledge.service import get_knowledge_service
+    identity = current_scm_context()
+    role = identity.role if identity is not None else "admin"
+    hits = get_knowledge_service().search("合同审批 赔偿 预付款", tenant_id=tenant_id,
+                                          role=role)
     policy_ref = hits[0].text[:120] if hits else "超阈值需审批"
     trace = ["retrieve_policy", "judge_rule"]
 
@@ -156,7 +160,7 @@ def _group_sales(rows: list[dict]) -> dict:
 
 
 def analyze_sales(question: str, tenant_id: str = "t1",
-                  data_path: str | Path | None = None) -> dict:
+                  data_path: str | Path | None = None, range: str = "7d") -> dict:
     """销售分析：样例数据聚合 → metrics/knowledge 工具 → 结构化结论。"""
     rows: list[dict] | None = None
     source = Path(data_path) if data_path else DATA_DIR / "sales_week.json"
@@ -183,12 +187,25 @@ def analyze_sales(question: str, tenant_id: str = "t1",
     reg = build_default_registry()
     trace = ["load_sales_fixture"]
     metrics = _group_sales(rows)
+    scm_sales = None
+    if os.environ.get("SCM_GATEWAY_URL"):
+        try:
+            scm_sales = reg.call("scm.sales.report", {
+                "range": range, "tenant_id": tenant_id,
+            })
+            if isinstance(scm_sales, dict) and scm_sales.get("outcome") == "error":
+                raise RuntimeError("SCM sales report returned an error outcome")
+            trace.append("scm.sales.report")
+        except Exception as e:  # noqa: BLE001 - fixture analysis remains available
+            logging.getLogger(__name__).warning("scm.sales.report failed: %r", e)
+            scm_sales = None
 
     try:
-        ops_metrics = reg.call("metrics.get", {"service": "mall"})
         trace.append("metrics.get")
+        ops_metrics = reg.call("metrics.get", {"service": "mall"})
     except Exception as e:  # noqa: BLE001
         logging.getLogger(__name__).warning("metrics.get failed: %r", e)
+        trace.append("metrics.get:unavailable")
         ops_metrics = "metrics 暂不可用"
 
     try:
@@ -228,7 +245,8 @@ def analyze_sales(question: str, tenant_id: str = "t1",
         f"- 支付失败：{metrics['failed_payments_first']} → {metrics['failed_payments_last']}\n"
         f"- 类目最差：{worst['category'] + ' ' + str(worst['change_pct']) + '%' if worst else '无'}\n"
         f"- 运维指标：{ops_metrics}\n"
-        f"- 知识库：{str(kb)[:300]}\n"
+        + (f"- SCM销售看板：{str(scm_sales)[:500]}\n" if scm_sales is not None else "")
+        + f"- 知识库：{str(kb)[:300]}\n"
         f"- 建议：{recommendation}"
     )
     return {"status": "ok", "report": report, "metrics": metrics,
@@ -243,14 +261,15 @@ def _try_or_knowledge(reg, primary_name: str, primary_args: dict, fallback_args:
                       trace: list, placeholder: str) -> str:
     """Try primary tool; on exception, fall back to knowledge.search; on second failure, placeholder."""
     try:
-        result = reg.call(primary_name, primary_args)
         trace.append(primary_name)
+        result = reg.call(primary_name, primary_args)
         return result
     except Exception as e:
         logging.getLogger(__name__).warning("%s failed: %r", primary_name, e)
+        trace.append(f"{primary_name}:unavailable")
         try:
-            result = reg.call("knowledge.search", fallback_args)
             trace.append("knowledge.search")
+            result = reg.call("knowledge.search", fallback_args)
             return result
         except Exception:
             return placeholder
@@ -264,7 +283,7 @@ def run_it_ops(question: str, tenant_id: str = "t1") -> dict:
     """
     from agent.tools.builtin import build_default_registry
     reg = build_default_registry()
-    trace = []
+    trace: list[str] = []
     order = "订单暂不可用"
 
     metrics = _try_or_knowledge(
@@ -274,17 +293,15 @@ def run_it_ops(question: str, tenant_id: str = "t1") -> dict:
         reg, "logs.search", {"query": question, "tenant_id": tenant_id},
         {"query": question, "tenant_id": tenant_id}, trace, "logs 暂不可用")
 
-    logs_text = str(logs).lower()
-    if any(k in logs_text for k in ("error", "timeout", "500", "失败")):
-        m = _ORDER_PATTERN.search(question)
-        if m and "scm.order.get" in reg.list_tools():
-            try:
-                order = reg.call("scm.order.get", {"order_no": m.group(0),
-                                                   "tenant_id": tenant_id})
-                trace.append("scm.order.get")
-            except Exception as e:
-                logging.getLogger(__name__).warning("scm.order.get failed: %r", e)
-                order = "订单暂不可用"
+    m = _ORDER_PATTERN.search(question)
+    if m and "scm.order.get" in reg.list_tools():
+        try:
+            order = reg.call("scm.order.get", {"order_no": m.group(0),
+                                               "tenant_id": tenant_id})
+            trace.append("scm.order.get")
+        except Exception as e:
+            logging.getLogger(__name__).warning("scm.order.get failed: %r", e)
+            order = "订单暂不可用"
 
     report = (
         f"IT Ops 诊断报告：{question}\n"

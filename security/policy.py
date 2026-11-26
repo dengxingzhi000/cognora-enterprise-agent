@@ -1,6 +1,10 @@
 """Policy Engine: User/Role → Tool前检查。LLM不能直调工具。"""
 HIGH_RISK = {"payment.execute", "data.delete", "contract.approve", "email.send"}
-READ_TOOLS = {"metrics.get", "logs.search", "git.diff", "knowledge.search", "db.query"}
+READ_TOOLS = {
+    "metrics.get", "logs.search", "git.diff", "knowledge.search",
+    "system.describe", "system.analyze",
+    "workflow.list", "workflow.get", "workflow.analyze", "trace.explain",
+}
 
 
 class PolicyEngine:
@@ -13,7 +17,7 @@ class PolicyEngine:
         if tool in HIGH_RISK:
             return {"decision": "need_approval", "reason": f"{tool} is high-risk"}
 
-        if tool in ("metrics.get", "logs.search", "git.diff", "knowledge.search"):
+        if tool in READ_TOOLS:
             return {"decision": "allow", "reason": "low-risk read"}
 
         if tool == "db.query":

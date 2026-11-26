@@ -1,6 +1,6 @@
 """企业文档元数据：每个Chunk都带租户/权限，检索时强制过滤。"""
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 
 @dataclass

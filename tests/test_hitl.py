@@ -11,6 +11,15 @@ def _mock_schema(monkeypatch):
 
 def _mock_planner(monkeypatch):
     import apps.api.main as main_mod
+    from agent.tools import executor as executor_mod
+    from agent.tools.registry import Registry, Tool
+
+    # HITL mechanics use an explicit successful test double. The production SCM
+    # write tool is intentionally unsupported and has separate contract tests.
+    registry = Registry()
+    registry.register(Tool("scm.purchase.create", "test-only approved write",
+                           lambda args: "created by test double"))
+    monkeypatch.setattr(executor_mod, "_default_registry", registry)
 
     def fake_planner(state):
         if state.observations:
@@ -25,6 +34,7 @@ def _mock_planner(monkeypatch):
 def paused_task(monkeypatch):
     """经公开 /chat 进入 paused，返回 (client, chat_payload)。"""
     from fastapi.testclient import TestClient
+
     from apps.api.main import app
 
     _mock_planner(monkeypatch)
@@ -103,6 +113,7 @@ def test_resume_without_body_does_not_422(paused_task):
 def test_paused_tasks_are_tenant_scoped(monkeypatch):
     """同一 task_id 在两个租户下互不覆盖。"""
     from fastapi.testclient import TestClient
+
     from apps.api.main import app
 
     _mock_planner(monkeypatch)
@@ -185,8 +196,9 @@ def test_guarded_executor_executes_with_matching_approved_id():
         state, user=user, policy=PolicyEngine(), approvals=store,
         approved_approval_id=aid,
     )
-    # 占位写口被真正调用（返回占位字符串），而不是再次挂起
-    assert out["result"] == "need approval: scm.purchase.create pending human review"
+    # 审批只放行调用；未实现的写口仍必须失败，不能被记为成功。
+    assert out["outcome"] == "error"
+    assert out["result"] == "tool error scm.purchase.create"
     assert "pause_reason" not in state.context
     assert len(store._items) == 1
 
@@ -230,7 +242,7 @@ def test_guarded_executor_ignores_approved_id_for_other_args():
 
     state = AgentState(task="buy X")
     state.context["tenant_id"] = "t1"
-    out = guarded_executor(
+    guarded_executor(
         {"action": "call_tool", "tool": "scm.purchase.create",
          "args": {"sku": "B", "tenant_id": "t1"}},
         state, user=user, policy=PolicyEngine(), approvals=store,

@@ -1,7 +1,8 @@
 """agent/context/memory_providers.py: 九层补齐 User/Org/Conv/Episodic 四实现。"""
 from agent.memory.store import MemoryStore
 from infrastructure.pg.connector import OperationalError
-from .providers import PRIORITY
+
+from .providers import PRIORITY, BaseProvider
 
 
 class MemoryOutage(Exception):
@@ -11,18 +12,14 @@ class MemoryOutage(Exception):
 def _default_store() -> MemoryStore:
     """AGENT_PG_DSN 存在时只走 agent 库；否则保留旧版 PG_DSN MemoryStore 行为。"""
     import os
+
     from infrastructure.pg.connector import get_agent_connector, get_connector
     if os.environ.get("AGENT_PG_DSN"):
         return MemoryStore(get_agent_connector())
     return MemoryStore(get_connector())
 
 
-def _get_base():
-    from .providers import BaseProvider
-    return BaseProvider
-
-
-class BaseMemoryProvider(_get_base()):
+class BaseMemoryProvider(BaseProvider):
     layer = "memory"
     permission = "tenant"
 

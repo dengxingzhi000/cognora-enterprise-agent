@@ -1,11 +1,8 @@
 """SCM-platform integration: client/auth/tools/policy_map.
 
-LLM 永远不直调 client；统一经 Registry Tool + PolicyEngine 管控。
-无 SCM_GATEWAY_URL 配置时 tools 回退 Mock，保证离线可测。
+LLM calls tools only through the Registry and PolicyEngine. Without
+SCM_GATEWAY_URL, read tools use deterministic mocks for offline tests.
 """
-try:
-    from .tools import register_scm_tools
-except ImportError:
-    register_scm_tools = None  # tools.py lands in Task 3
+from .tools import register_scm_tools
 
 __all__ = ["register_scm_tools"]

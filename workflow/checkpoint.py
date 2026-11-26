@@ -1,17 +1,24 @@
-"""Checkpointer 工厂：PG 优先，内存兜底，保证离线测试不断。统一 get/put 接口。"""
+"""LangGraph checkpointer factory with optional Postgres persistence."""
 import warnings
 
 
-class MemoryCheckpointer:
-    def __init__(self):
-        self._store: dict[str, dict] = {}
+class CheckpointUnavailable(RuntimeError):
+    pass
 
-    def put(self, thread_id: str, state: dict) -> None:
-        self._store[thread_id] = dict(state)
 
-    def get(self, thread_id: str) -> dict | None:
-        v = self._store.get(thread_id)
-        return dict(v) if v is not None else None
+def native_saver_of(store):
+    """Return the native LangGraph saver used by ``compile(checkpointer=...)``."""
+    if store is None:
+        return None
+    native = getattr(store, "native", None)
+    if native is not None:
+        return native
+    inner = getattr(store, "_inner", None)
+    if inner is not None:
+        return inner
+    if hasattr(store, "get_tuple") and hasattr(store, "put"):
+        return store
+    return None
 
 
 def _config_for(thread_id: str) -> dict:
@@ -77,7 +84,7 @@ class _SaverAdapter:
             except TypeError:
                 inner.put(config, dict(payload))
         except Exception as exc:
-            warnings.warn(f"native checkpointer put failed, using in-memory mirror: {exc}")
+            warnings.warn(f"native checkpointer put failed, using in-memory mirror: {exc}", stacklevel=2)
 
     def get(self, thread_id: str) -> dict | None:
         inner = self._inner
@@ -90,7 +97,7 @@ class _SaverAdapter:
                     self._mem[thread_id] = dict(unwrapped)
                     return dict(unwrapped)
             except Exception as exc:
-                warnings.warn(f"native checkpointer get failed, using in-memory mirror: {exc}")
+                warnings.warn(f"native checkpointer get failed, using in-memory mirror: {exc}", stacklevel=2)
         v = self._mem.get(thread_id)
         return dict(v) if v is not None else None
 
@@ -112,8 +119,12 @@ def _with_connect_timeout(dsn: str, seconds: int = 3) -> str:
 
 
 def get_checkpointer(dsn: str | None = None):
+    import os
+
     from infrastructure.pg.connector import agent_dsn
-    dsn = dsn or agent_dsn()
+    explicit = dsn is not None
+    dsn = dsn if explicit else agent_dsn()
+    strict = os.getenv("AGENT_STRICT_PERSISTENCE", "").lower() in {"1", "true", "yes", "on"}
     if dsn:
         try:
             from langgraph.checkpoint.postgres import PostgresSaver  # type: ignore
@@ -127,10 +138,8 @@ def get_checkpointer(dsn: str | None = None):
                 raise
             return _SaverAdapter(saver, context=ctx)
         except Exception as exc:
-            warnings.warn(f"PostgresSaver unavailable ({exc}), falling back to memory saver")
-    try:
-        from langgraph.checkpoint.memory import MemorySaver  # type: ignore
-        return _SaverAdapter(MemorySaver())
-    except Exception as exc:
-        warnings.warn(f"langgraph saver unavailable ({exc}), using in-memory checkpointer")
-        return MemoryCheckpointer()
+            if explicit or strict:
+                raise CheckpointUnavailable("Postgres checkpointer is unavailable") from exc
+            warnings.warn(f"PostgresSaver unavailable ({exc}), falling back to memory saver", stacklevel=2)
+    from langgraph.checkpoint.memory import MemorySaver
+    return MemorySaver()

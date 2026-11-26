@@ -53,7 +53,7 @@ def test_provider_compress_keeps_recent_and_summarizes_old():
 
 def test_provider_compress_kept_segments_are_copies():
     from agent.context.providers import ObservationProvider
-    segs = [{"name": "observation[{}]".format(i), "priority": 20, "text": f"orig-{i}"}
+    segs = [{"name": f"observation[{i}]", "priority": 20, "text": f"orig-{i}"}
             for i in range(3)]
     p = ObservationProvider()
     kept, summary = p.compress(segs, keep_recent=1)
@@ -109,7 +109,8 @@ def test_assembler_compresses_per_layer_not_per_seg():
     from agent.context.assembler import ContextAssembler
     from agent.context.budget import TokenBudget
     from agent.context.providers import (
-        get_default_providers, ObservationProvider,
+        ObservationProvider,
+        get_default_providers,
     )
     big = "ERROR trace " * 50
     state = {"task": "查500", "system": "你是助手。",
@@ -142,11 +143,11 @@ def test_assembler_compresses_per_layer_not_per_seg():
 
 
 def test_loop_emits_tracer_event_when_trace_id_present(monkeypatch):
-    from agent.runtime.state import AgentState
-    from agent.runtime.loop import run
+    import observability.tracing as tracing
     from agent.context.assembler import ContextAssembler
     from agent.context.budget import TokenBudget
-    import observability.tracing as tracing
+    from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
     from observability.tracing import Tracer
 
     asm = ContextAssembler(budget=TokenBudget(total=400, reserved_for_output=0))
@@ -174,11 +175,11 @@ def test_loop_emits_tracer_event_when_trace_id_present(monkeypatch):
 
 
 def test_loop_silent_when_no_trace_id():
-    from agent.runtime.state import AgentState
-    from agent.runtime.loop import run
+    import observability.tracing as tracing
     from agent.context.assembler import ContextAssembler
     from agent.context.budget import TokenBudget
-    import observability.tracing as tracing
+    from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
 
     asm = ContextAssembler(budget=TokenBudget(total=400, reserved_for_output=0))
     calls = {"n": 0}

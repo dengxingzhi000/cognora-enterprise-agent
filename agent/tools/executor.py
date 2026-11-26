@@ -1,4 +1,5 @@
 """Registry Executor: 把 Planner 的 call_tool 翻译成真实调用。工具失败→Observation，不抛异常。"""
+import contextvars
 import logging
 import os
 import threading
@@ -38,10 +39,11 @@ def execute_with_timeout(fn, timeout_seconds: float | None = None):
     """
     timeout = tool_timeout_seconds() if timeout_seconds is None else float(timeout_seconds)
     box: dict = {}
+    context = contextvars.copy_context()
 
     def _target():
         try:
-            box["result"] = fn()
+            box["result"] = context.run(fn)
         except BaseException as e:  # noqa: BLE001 - 原样抛回调用线程
             box["error"] = e
 
@@ -67,24 +69,35 @@ def registry_executor(plan: dict, state, registry=None) -> dict:
     tool = plan.get("tool", "")
     args = plan.get("args", {}) or {}
     ok = True
-    try:
-        result = reg.call(tool, args)
-    except KeyError:
+    outcome = "success"
+    get_tool = getattr(reg, "get", None)
+    known = True
+    if get_tool is not None:
+        try:
+            get_tool(tool)
+        except KeyError:
+            known = False
+    if not known:
         ok = False
+        outcome = "unknown_tool"
         result = f"unknown tool: {tool}"
-    except Exception:  # noqa: BLE001 - 工具错误必须变成Observation
-        # 异常文本只进日志（含栈），Observation 只保留工具名，避免把异常信息
-        # 经 /chat 或 /chat/{task_id}/resume 回显给调用方（py/stack-trace-exposure）。
-        logger.exception("tool %s failed", tool)
-        ok = False
-        result = f"tool error {tool}"
+    else:
+        try:
+            result = reg.call(tool, args)
+        except Exception:  # noqa: BLE001 - 工具错误必须变成Observation
+            # 异常文本只进日志（含栈），Observation 只保留工具名，避免把异常信息
+            # 经 /chat 或 /chat/{task_id}/resume 回显给调用方（py/stack-trace-exposure）。
+            logger.exception("tool %s failed", tool)
+            ok = False
+            outcome = "error"
+            result = f"tool error {tool}"
     try:
         from observability.metrics import record_tool_call
         record_tool_call(tool, ok)
     except Exception:  # noqa: BLE001
         pass
     state.tool_calls.append({"tool": tool, "args": args})
-    return {"tool": tool, "result": str(result)}
+    return {"tool": tool, "result": str(result), "outcome": outcome}
 
 
 def guarded_executor(plan: dict, state, registry=None, user=None,
@@ -96,11 +109,27 @@ def guarded_executor(plan: dict, state, registry=None, user=None,
     调用；否则仍按 need_approval 挂起。
     """
     tool = plan.get("tool", "")
-    args = plan.get("args", {}) or {}
+    args = dict(plan.get("args", {}) or {})
+    if tool == "knowledge.search":
+        # The model may suggest permissions, but only the authenticated role can
+        # decide them. Overwrite before Policy and StructuredTool schema parsing.
+        from knowledge.service import permissions_for_role
+        role = user.get("role") if user is not None else None
+        args["allowed_permissions"] = permissions_for_role(role)
+        plan = {**plan, "args": args}
+    if user is not None:
+        tenant_id = user.get("tenant_id")
+        if tenant_id:
+            if "tenant_id" in args and args["tenant_id"] != tenant_id:
+                return {"tool": tool, "result": "Policy DENY: cross-tenant action",
+                        "outcome": "denied"}
+            args.setdefault("tenant_id", tenant_id)
+            plan = {**plan, "args": args}
     if policy is not None and user is not None:
         decision = policy.check(user, tool, args).get("decision")
         if decision == "deny":
-            return {"tool": tool, "result": f"Policy DENY: role={user.get('role')} tool={tool}"}
+            return {"tool": tool, "result": f"Policy DENY: role={user.get('role')} tool={tool}",
+                    "outcome": "denied"}
         if decision == "need_approval":
             if approved_approval_id is not None and approvals is not None:
                 try:
@@ -121,5 +150,6 @@ def guarded_executor(plan: dict, state, registry=None, user=None,
                 ctx["approval_id"] = aid
                 ctx["approval_tool"] = tool
                 ctx["approval_args"] = args
-            return {"tool": tool, "result": f"need approval {aid}: {tool} pending human review"}
+            return {"tool": tool, "result": f"need approval {aid}: {tool} pending human review",
+                    "outcome": "approval_required"}
     return registry_executor(plan, state, registry=registry)

@@ -1,4 +1,4 @@
-"""只读运维视图：列出卡住的写工具 effect（stale started 且审批无活跃租约）。
+"""只读运维视图：列出卡住的写工具 effect 与需要人工对账的不确定结果。
 
 用法::
 
@@ -39,29 +39,36 @@ def main() -> int:
     repo = PostgresToolEffectRepository(connector)
     seconds = args.stale_seconds or tool_effect_stale_seconds()
     rows = repo.list_stale_started(seconds)
+    reconciliation = repo.list_manual_reconciliation()
     if args.tenant:
         rows = [r for r in rows if r["tenant_id"] == args.tenant]
+        reconciliation = [r for r in reconciliation if r["tenant_id"] == args.tenant]
     rows = rows[: max(1, args.limit)]
+    reconciliation = reconciliation[: max(1, args.limit)]
 
-    print(f"stale window: {seconds}s; stuck effects: {len(rows)}")
-    if not rows:
-        return 0
+    print(f"stale window: {seconds}s; stuck effects: {len(rows)}; "
+          f"manual reconciliation: {len(reconciliation)}")
     header = ("tenant_id", "approval_id", "tool_name", "args_hash", "status", "attempt",
-              "maybe_side_effect", "updated_at", "approval_status", "lease_until")
-    print("\t".join(header))
-    for row in rows:
-        print("\t".join([
-            str(row["tenant_id"]),
-            str(row["approval_id"]),
-            str(row["tool_name"]),
-            str(row["args_hash"])[:8],
-            str(row["status"]),
-            str(row["attempt"]),
-            "true" if row["maybe_side_effect"] else "false",
-            row["updated_at"].isoformat() if row.get("updated_at") else "-",
-            str(row.get("approval_status") or "-"),
-            row["approval_lease_until"].isoformat() if row.get("approval_lease_until") else "-",
-        ]))
+              "maybe_side_effect", "last_error", "updated_at", "approval_status", "lease_until")
+    for section, items in (("stale", rows), ("reconciliation", reconciliation)):
+        if not items:
+            continue
+        print(f"[{section}]")
+        print("\t".join(header))
+        for row in items:
+            print("\t".join([
+                str(row["tenant_id"]),
+                str(row["approval_id"]),
+                str(row["tool_name"]),
+                str(row["args_hash"])[:8],
+                str(row["status"]),
+                str(row["attempt"]),
+                "true" if row["maybe_side_effect"] else "false",
+                str(row.get("last_error") or "-"),
+                row["updated_at"].isoformat() if row.get("updated_at") else "-",
+                str(row.get("approval_status") or "-"),
+                row["approval_lease_until"].isoformat() if row.get("approval_lease_until") else "-",
+            ]))
     return 0
 
 

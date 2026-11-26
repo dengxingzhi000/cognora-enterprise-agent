@@ -8,8 +8,9 @@ def test_counter_returns_plausible_count():
 def test_counter_fallback_when_tiktoken_missing(monkeypatch):
     import sys
     monkeypatch.setitem(sys.modules, "tiktoken", None)
-    from agent.context import counter as counter_mod
     import importlib
+
+    from agent.context import counter as counter_mod
     importlib.reload(counter_mod)
     try:
         c = counter_mod.get_counter()
@@ -112,8 +113,8 @@ def test_provider_priority_drop_order_conversation_before_tooltrace():
 
 
 def test_rag_tiered_priority_low_score_dropped_first():
-    from agent.context.providers import RagProvider
     from agent.context.budget import TokenBudget
+    from agent.context.providers import RagProvider
     rp = RagProvider()
     segs = rp.collect({"rag": [{"text": "low", "score": 0.1}, {"text": "high", "score": 0.9}]})
     assert segs[0]["priority"] == 40 + int(0.1 * 20)
@@ -148,7 +149,7 @@ def test_truncation_keeps_system_role():
 def test_assembler_skipped_providers_reported():
     from agent.context.assembler import ContextAssembler
     from agent.context.budget import TokenBudget
-    from agent.context.providers import SystemProvider, BaseProvider
+    from agent.context.providers import BaseProvider, SystemProvider
 
     class BoomProvider(BaseProvider):
         name = "boom"
@@ -170,7 +171,7 @@ def test_assembler_skipped_providers_reported():
 def test_assembler_same_name_segs_unique_drop():
     from agent.context.assembler import ContextAssembler
     from agent.context.budget import TokenBudget
-    from agent.context.providers import SystemProvider, RagProvider
+    from agent.context.providers import RagProvider, SystemProvider
 
     class FixedCounter:
         def count(self, text):
@@ -195,6 +196,7 @@ def test_assembler_same_name_segs_unique_drop():
 
 def test_rag_provider_score_hardening_per_item():
     import math
+
     from agent.context.providers import RagProvider
     rp = RagProvider()
     rag = [
@@ -217,10 +219,10 @@ def test_rag_provider_score_hardening_per_item():
 
 
 def test_loop_with_assembler_bounded_and_answer_preserved():
-    from agent.runtime.state import AgentState
-    from agent.runtime.loop import run
     from agent.context.assembler import ContextAssembler
     from agent.context.budget import TokenBudget
+    from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
     calls = {"n": 0}
     def planner(state):
         calls["n"] += 1

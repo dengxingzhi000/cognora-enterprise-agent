@@ -1,8 +1,8 @@
 """AgentTask + 状态机 wrapper tests (spec#4 Task 1)."""
 import pytest
 
-from agent.runtime.state import AgentState
 from agent.runtime.agent_task import AgentTask, InvalidTransition
+from agent.runtime.state import AgentState
 
 
 def test_agent_task_from_state_auto_uuid_and_pending():
@@ -15,6 +15,13 @@ def test_agent_task_from_state_auto_uuid_and_pending():
     assert t.state is s
     assert t.token_usage == {"input": 0, "output": 0, "total": 0}
     assert t.cost == 0.0
+
+
+def test_agent_task_from_state_inherits_context_tenant():
+    state = AgentState(task="x")
+    state.context["tenant_id"] = "tenant-from-state"
+    task = AgentTask.from_state(state)
+    assert task.tenant_id == "tenant-from-state"
 
 
 def test_agent_task_transition_legal_and_illegal():
@@ -43,7 +50,7 @@ def test_agent_task_history_capped_at_50():
 
 
 def test_counter_count_messages_returns_input_and_output():
-    from agent.runtime.counter import get_counter, HeuristicCounter
+    from agent.runtime.counter import get_counter
     c = get_counter()
     out = c.count_messages([{"role": "system", "content": "你是助手"},
                             {"role": "user", "content": "你好"}])
@@ -54,8 +61,10 @@ def test_counter_count_messages_returns_input_and_output():
 def test_counter_falls_back_heuristic_when_tiktoken_missing(monkeypatch):
     import sys
     monkeypatch.setitem(sys.modules, "tiktoken", None)
-    from agent.runtime import counter as cmod
+    monkeypatch.setenv("AGENT_TOKEN_COUNTER", "tiktoken")
     import importlib
+
+    from agent.runtime import counter as cmod
     importlib.reload(cmod)
     try:
         c = cmod.get_counter()
@@ -66,8 +75,55 @@ def test_counter_falls_back_heuristic_when_tiktoken_missing(monkeypatch):
         importlib.reload(cmod)
 
 
+def test_counter_default_never_initializes_network_tokenizer(monkeypatch):
+    import sys
+    import types
+
+    fake = types.ModuleType("tiktoken")
+
+    initialized = []
+
+    def unexpected_download(name):
+        initialized.append(name)
+        raise AssertionError("default counter must not initialize tiktoken")
+
+    fake.get_encoding = unexpected_download
+    monkeypatch.setitem(sys.modules, "tiktoken", fake)
+    monkeypatch.delenv("AGENT_TOKEN_COUNTER", raising=False)
+    from agent.runtime.counter import HeuristicCounter, get_counter
+
+    assert isinstance(get_counter(), HeuristicCounter)
+    assert initialized == []
+
+
+def test_counter_tiktoken_opt_in_initializes_encoding(monkeypatch):
+    import sys
+    import types
+
+    fake = types.ModuleType("tiktoken")
+    calls = []
+
+    class Encoding:
+        def encode(self, text):
+            return list(text.encode("utf-8"))
+
+    def get_encoding(name):
+        calls.append(name)
+        return Encoding()
+
+    fake.get_encoding = get_encoding
+    monkeypatch.setitem(sys.modules, "tiktoken", fake)
+    monkeypatch.setenv("AGENT_TOKEN_COUNTER", "tiktoken")
+    from agent.runtime.counter import TiktokenCounter, get_counter
+
+    counter = get_counter()
+    assert isinstance(counter, TiktokenCounter)
+    assert counter.count_messages([{"role": "user", "content": "hi"}])["input"] == 2
+    assert calls == ["cl100k_base"]
+
+
 def test_pricing_accumulates_cost():
-    from agent.runtime.counter import get_pricing, Pricing
+    from agent.runtime.counter import Pricing, get_pricing
     p = get_pricing("deepseek-chat")
     assert isinstance(p, Pricing)
     cost = (100 / 1000) * p.input_per_1k + (50 / 1000) * p.output_per_1k
@@ -75,23 +131,25 @@ def test_pricing_accumulates_cost():
 
 
 def test_loop_wraps_agent_state_and_emits_status_changes():
-    from agent.runtime.state import AgentState
     from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
     from observability.tracing import Tracer
     calls: list[dict] = []
     class Fake(Tracer):
         def log_event(self, trace_id, stage, data):
             calls.append({"trace_id": trace_id, "stage": stage, "data": data})
-    t = Fake(); tid = t.start_trace("t")
-    s = AgentState(task="x"); s.context["trace_id"] = tid
+    t = Fake()
+    tid = t.start_trace("t")
+    s = AgentState(task="x")
+    s.context["trace_id"] = tid
     run(s, planner=lambda st: {"action": "finish", "answer": "ok"},
         executor=lambda p, st: None)
     assert any(c["stage"] == "task_status_changed" and c["trace_id"] == tid for c in calls)
 
 
 def test_loop_max_iterations_marks_failed():
-    from agent.runtime.state import AgentState
     from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
     def planner(state):
         return {"action": "call_tool", "tool": "noop", "args": {}}
     def executor(plan, state):
@@ -103,8 +161,8 @@ def test_loop_max_iterations_marks_failed():
 
 
 def test_loop_records_tokens_each_round():
-    from agent.runtime.state import AgentState
     from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
     s = run(AgentState(task="x"),
             planner=lambda st: {"action": "finish", "answer": "ok"},
             executor=lambda p, st: None)
@@ -115,8 +173,8 @@ def test_loop_records_tokens_each_round():
 
 
 def test_loop_planner_exception_marks_failed():
-    from agent.runtime.state import AgentState
     from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
     def planner(state):
         raise RuntimeError("boom")
     def executor(plan, state):
@@ -132,8 +190,8 @@ def test_loop_planner_exception_marks_failed():
 
 
 def test_loop_executor_exception_marks_failed():
-    from agent.runtime.state import AgentState
     from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
     def planner(state):
         return {"action": "call_tool", "tool": "noop", "args": {}}
     def executor(plan, state):
@@ -149,8 +207,8 @@ def test_loop_executor_exception_marks_failed():
 
 
 def test_loop_records_tokens_on_unknown_action_failure():
-    from agent.runtime.state import AgentState
     from agent.runtime.loop import run
+    from agent.runtime.state import AgentState
     def planner(state):
         return {"action": "weird_unknown_action"}
     def executor(plan, state):
@@ -164,6 +222,7 @@ def test_loop_records_tokens_on_unknown_action_failure():
 
 def test_api_returns_task_id_and_status():
     from fastapi.testclient import TestClient
+
     from apps.api.main import app
     c = TestClient(app)
     r = c.post("/chat", json={"message": "x"})

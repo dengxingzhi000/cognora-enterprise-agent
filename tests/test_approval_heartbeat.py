@@ -11,7 +11,6 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from apps.api.main import app
 from security.approval import (
     ApprovalStore,
     InMemoryApprovalRepository,
@@ -256,9 +255,9 @@ def test_api_tool_timeout_marks_failed_and_stops_heartbeat(monkeypatch):
     """卡死的工具不会靠心跳续命永远停在 in_progress。"""
     import agent.tools.executor as executor_module
     import apps.api.main as main
+    from agent.runtime.paused_tasks import PausedTaskStore
     from infrastructure.pg import connector as connector_module
     from infrastructure.pg import schema as schema_module
-    from agent.runtime.paused_tasks import PausedTaskStore
 
     monkeypatch.setattr(connector_module, "get_connector", lambda: None)
     monkeypatch.setattr(schema_module, "ensure_schema", lambda c: None)
@@ -340,9 +339,9 @@ def test_frozen_heartbeat_stale_complete_is_409_and_row_unchanged(monkeypatch):
     """
     import agent.tools.executor as executor_module
     import apps.api.main as main
+    from agent.runtime.paused_tasks import PausedTaskStore
     from infrastructure.pg import connector as connector_module
     from infrastructure.pg import schema as schema_module
-    from agent.runtime.paused_tasks import PausedTaskStore
 
     monkeypatch.setattr(connector_module, "get_connector", lambda: None)
     monkeypatch.setattr(schema_module, "ensure_schema", lambda c: None)
@@ -424,9 +423,11 @@ def test_frozen_heartbeat_stale_complete_is_409_and_row_unchanged(monkeypatch):
 # --- Prometheus 计数器 ------------------------------------------------------
 
 def test_approval_metric_counters_increment():
+    from prometheus_client import CollectorRegistry
+
     from observability import metrics
 
-    backend = metrics.configure_metrics(memory=True)
+    backend = metrics.configure_metrics(registry=CollectorRegistry())
     try:
         store = _store()
         aid, token = _approved_claim(store, lease_seconds=1)

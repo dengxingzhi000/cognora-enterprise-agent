@@ -28,8 +28,8 @@ def connector():
 
 def test_agent_pg_dsn_activates_postgres_factories(monkeypatch):
     monkeypatch.setenv("AGENT_PG_DSN", DSN)
-    from security.approval import build_approval_store, PostgresApprovalRepository
-    from agent.runtime.paused_tasks import build_paused_task_store, PostgresPausedTaskRepository
+    from agent.runtime.paused_tasks import PostgresPausedTaskRepository, build_paused_task_store
+    from security.approval import PostgresApprovalRepository, build_approval_store
     assert isinstance(build_approval_store()._repo, PostgresApprovalRepository)
     assert isinstance(build_paused_task_store()._repo, PostgresPausedTaskRepository)
 
@@ -75,9 +75,9 @@ def test_approval_postgres_roundtrip(connector):
 
 
 def test_paused_task_postgres_roundtrip_and_tenant_scope(connector):
+    from agent.runtime.agent_task import AgentTask
     from agent.runtime.paused_tasks import PausedTaskStore, PostgresPausedTaskRepository
     from agent.runtime.state import AgentState
-    from agent.runtime.agent_task import AgentTask
 
     repo = PostgresPausedTaskRepository(connector)
     store = PausedTaskStore(repo)

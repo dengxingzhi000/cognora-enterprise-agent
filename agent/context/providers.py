@@ -95,8 +95,12 @@ def get_default_providers() -> list:
     global DEFAULT_PROVIDERS
     if DEFAULT_PROVIDERS is not None:
         return DEFAULT_PROVIDERS
-    from .memory_providers import (UserMemoryProvider, OrgMemoryProvider,
-                                   ConvMemoryProvider, EpisodicMemoryProvider)
+    from .memory_providers import (
+        ConvMemoryProvider,
+        EpisodicMemoryProvider,
+        OrgMemoryProvider,
+        UserMemoryProvider,
+    )
     DEFAULT_PROVIDERS = [SystemProvider(), TaskProvider(), RagProvider(),
                         ObservationProvider(), ConversationProvider(),
                         UserMemoryProvider(), OrgMemoryProvider(), ConvMemoryProvider(),

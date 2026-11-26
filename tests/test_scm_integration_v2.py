@@ -1,4 +1,5 @@
 """SCM integration v2: Phase 1 (Foundation) + Phase 2 + Phase 3 tests."""
+import pytest
 
 
 def test_write_tools_all_registered():
@@ -150,14 +151,156 @@ def test_scm_supplier_get_mock_payload():
     assert "credit_score" in s or "rating" in s
 
 
+def test_scm_read_tools_use_gateway_paths_and_tenant_header(monkeypatch):
+    from agent.tools.registry import Registry
+    from integrations.scm.tools import register_scm_tools
+
+    monkeypatch.setenv("SCM_TENANT_MAP", '{"t1":"019a0aee-0000-7000-8000-000000000002"}')
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None, headers=None):
+            self.calls.append(("GET", path, params, headers))
+            return 200, {"code": 200, "data": {"ok": True}}
+
+        def post(self, path, json=None, params=None, headers=None):
+            self.calls.append(("POST", path, json, headers))
+            return 200, {"code": 200, "data": {"records": []}}
+
+    client = FakeClient()
+    registry = Registry()
+    register_scm_tools(registry, client=client)
+    order_id = "019a0aee-0000-7000-8000-000000000001"
+    registry.call("scm.order.get", {"order_id": order_id, "tenant_id": "t1"})
+    registry.call("scm.order.get", {"order_no": "O-123", "tenant_id": "t1"})
+    registry.call("scm.inventory.query", {"sku": "SKU-1", "tenant_id": "t1"})
+    registry.call("scm.sales.report", {"range": "30d", "tenant_id": "t1"})
+    registry.call("scm.supplier.get", {"supplier_id": "SP-001", "tenant_id": "t1"})
+
+    tenant_header = {"X-Tenant-Id": "019a0aee-0000-7000-8000-000000000002"}
+    assert client.calls == [
+        ("GET", f"/scm-order/api/v1/orders/{order_id}", None, tenant_header),
+        ("POST", "/scm-order/api/v1/orders/query",
+         {"orderNo": "O-123", "pageNum": 1, "pageSize": 1}, tenant_header),
+        ("POST", "/platform-inventory/api/v1/inventory/query",
+         {"skuIds": ["SKU-1"], "page": 1, "size": 20}, tenant_header),
+        ("GET", "/scm-order/api/v1/orders/dashboard/summary",
+         {"range": "LAST_30_DAYS", "compare": "NONE"}, tenant_header),
+        ("GET", "/scm-supplier/api/v1/suppliers/SP-001", None, tenant_header),
+    ]
+
+
+@pytest.mark.parametrize("failure", ["http", "transport", "business"])
+def test_scm_read_failures_raise_structured_business_error(failure):
+    import pytest
+
+    from agent.tools.registry import Registry
+    from integrations.scm.tools import ToolBusinessError, register_scm_tools
+
+    class FakeClient:
+        def get(self, path, params=None, headers=None):
+            if failure == "transport":
+                raise RuntimeError("private token=secret")
+            if failure == "business":
+                return 200, {"code": 503, "message": "private token=secret"}
+            return 503, {"text": "private token=secret"}
+
+    registry = Registry()
+    register_scm_tools(registry, client=FakeClient())
+    with pytest.raises(ToolBusinessError) as caught:
+        registry.call("scm.supplier.get", {"supplier_id": "SP-001", "tenant_id": "t1"})
+    assert caught.value.tool == "scm.supplier.get"
+    assert "secret" not in str(caught.value)
+
+
+def test_scm_error_executor_marks_error_and_redacts_summary():
+    import pytest
+
+    from agent.runtime.state import AgentState
+    from agent.tools.executor import registry_executor
+    from agent.tools.registry import Registry
+    from integrations.scm.tools import ToolBusinessError, register_scm_tools
+
+    class FakeClient:
+        def get(self, path, params=None, headers=None):
+            raise ToolBusinessError("scm.supplier.get", "SCM_TRANSPORT_ERROR", "SCM request failed")
+
+    registry = Registry()
+    register_scm_tools(registry, client=FakeClient())
+    with pytest.raises(ToolBusinessError):
+        registry.call("scm.supplier.get", {"supplier_id": "SP-001", "tenant_id": "t1"})
+    out = registry_executor(
+        {"tool": "scm.supplier.get", "args": {"supplier_id": "SP-001", "tenant_id": "t1"}},
+        AgentState(task="x"), registry=registry,
+    )
+    assert out["outcome"] == "error"
+    assert out["result"] == "tool error scm.supplier.get"
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_scm_write_tools_raise_unsupported_without_http(monkeypatch, configured):
+    import pytest
+
+    from agent.tools.registry import Registry
+    from integrations.scm.tools import ToolBusinessError, register_scm_tools
+
+    if configured:
+        monkeypatch.setenv("SCM_GATEWAY_URL", "http://gateway")
+
+    class FakeClient:
+        def get(self, *args, **kwargs):
+            raise AssertionError("unsupported write must not call SCM")
+
+        def post(self, *args, **kwargs):
+            raise AssertionError("unsupported write must not call SCM")
+
+    registry = Registry()
+    register_scm_tools(registry, client=FakeClient() if configured else None)
+    cases = [
+        ("scm.purchase.create", {"sku": "SKU-1", "quantity": 1, "tenant_id": "t1"}),
+        ("scm.order.cancel", {"order_no": "O-123", "tenant_id": "t1"}),
+        ("scm.stock.adjust", {"sku": "SKU-1", "quantity": 1, "tenant_id": "t1"}),
+    ]
+    for tool, args in cases:
+        with pytest.raises(ToolBusinessError) as caught:
+            registry.call(tool, args)
+        assert caught.value.code == "UNSUPPORTED_TOOL"
+
+
+def test_approved_scm_write_still_has_error_outcome():
+    from agent.runtime.state import AgentState
+    from agent.tools.executor import guarded_executor
+    from agent.tools.registry import Registry
+    from integrations.scm.tools import register_scm_tools
+    from security.approval import ApprovalStore
+    from security.policy import PolicyEngine
+
+    registry = Registry()
+    register_scm_tools(registry)
+    user = {"tenant_id": "t1", "role": "admin", "user_id": "u1"}
+    args = {"sku": "SKU-1", "quantity": 1, "tenant_id": "t1"}
+    approvals = ApprovalStore()
+    aid = approvals.request(user, "scm.purchase.create", args)
+    approvals.approve(aid, "manager")
+    out = guarded_executor(
+        {"action": "call_tool", "tool": "scm.purchase.create", "args": args},
+        AgentState(task="buy"), registry=registry, user=user,
+        policy=PolicyEngine(), approvals=approvals, approved_approval_id=aid,
+    )
+    assert out["outcome"] == "error"
+    assert out["result"] == "tool error scm.purchase.create"
+
+
 def test_run_it_ops_basic():
     """Phase 2 #4: run_it_ops 返回 report + trace，trace 含 metrics + logs。"""
     from workflow.scenarios import run_it_ops
     out = run_it_ops("近7天为什么下降")
     assert "report" in out
     assert "trace" in out
-    assert "metrics.get" in out["trace"]
-    assert "logs.search" in out["trace"]
+    assert any(item.startswith("metrics.get") for item in out["trace"])
+    assert any(item.startswith("logs.search") for item in out["trace"])
 
 
 def test_run_it_ops_extracts_order_no():
@@ -227,8 +370,8 @@ def test_supplier_call_failure_does_not_break_review(monkeypatch):
 
 def test_client_emits_trace_event():
     """Phase 3 #7: 设 contextvar 时 _send 在前后各发一个 scm_call/scm_result 事件。"""
+    from integrations.scm.client import scm_trace_id
     from observability.tracing import Tracer
-    from integrations.scm.client import ScmClient, scm_trace_id
     Tracer._shared = Tracer()
     tid = "tr-v2-surface-test"
     token = scm_trace_id.set(tid)
@@ -242,8 +385,8 @@ def test_client_emits_trace_event():
 
 def test_client_log_event_fires_on_send(monkeypatch):
     """Phase 3 #7: 设 contextvar 时 _send 发 log_event。"""
-    from observability.tracing import Tracer
     from integrations.scm.client import ScmClient, scm_trace_id
+    from observability.tracing import Tracer
     Tracer._shared = Tracer()
     tid = "tr-send-test"
     token = scm_trace_id.set(tid)
@@ -273,8 +416,8 @@ def test_client_log_event_fires_on_send(monkeypatch):
 
 def test_client_no_trace_event_when_contextvar_unset(monkeypatch):
     """Phase 3 #7: contextvar 未设时 _send 不应发 log_event（容错）。"""
-    from observability.tracing import Tracer
     from integrations.scm.client import ScmClient, scm_trace_id
+    from observability.tracing import Tracer
     Tracer._shared = Tracer()
     assert scm_trace_id.get() is None
     captured = []
@@ -294,10 +437,10 @@ def test_client_no_trace_event_when_contextvar_unset(monkeypatch):
 
 def test_guarded_executor_writes_context_on_need_approval():
     """Phase 3 #5 链路第一步: need_approval 时 state.context 写入 pause 元数据。"""
-    from agent.tools.executor import guarded_executor
     from agent.runtime.state import AgentState
-    from security.policy import PolicyEngine
+    from agent.tools.executor import guarded_executor
     from security.approval import ApprovalStore
+    from security.policy import PolicyEngine
     state = AgentState(task="t")
     state.context["tenant_id"] = "t1"
     plan = {"action": "call_tool", "tool": "scm.purchase.create",
@@ -316,10 +459,10 @@ def test_guarded_executor_writes_context_on_need_approval():
 
 def test_guarded_executor_no_context_write_on_deny():
     """Phase 3 #5 联动: deny 时不写 pause 元数据。"""
-    from agent.tools.executor import guarded_executor
     from agent.runtime.state import AgentState
-    from security.policy import PolicyEngine
+    from agent.tools.executor import guarded_executor
     from security.approval import ApprovalStore
+    from security.policy import PolicyEngine
     state = AgentState(task="t")
     plan = {"action": "call_tool", "tool": "scm.order.get",
             "args": {"order_no": "O-1", "tenant_id": "t2"}}
@@ -336,9 +479,9 @@ def test_runtime_transitions_to_paused_on_need_approval():
     from agent.runtime.loop import run
     from agent.runtime.state import AgentState
     from agent.tools.executor import guarded_executor
-    from security.policy import PolicyEngine
-    from security.approval import ApprovalStore
     from observability.tracing import Tracer
+    from security.approval import ApprovalStore
+    from security.policy import PolicyEngine
 
     Tracer._shared = Tracer()
 
@@ -374,9 +517,9 @@ def test_runtime_transitions_to_paused_on_need_approval():
 def test_chat_payload_surfaces_approval_id(monkeypatch):
     """Phase 3 #5 链路第三步: /chat 在 status=paused 时 payload 含 approval_id。"""
     from fastapi.testclient import TestClient
-    from apps.api.main import app
+
     from agent.runtime import loop as loop_mod
-    from agent.runtime.state import AgentState
+    from apps.api.main import app
 
     def fake_run(state, planner=None, **kw):
         state.status = "paused"
@@ -405,9 +548,9 @@ def test_chat_payload_surfaces_approval_id(monkeypatch):
 def test_no_approval_field_when_not_paused(monkeypatch):
     """Phase 3 #5 联动: 普通 done 状态不含 approval_id。"""
     from fastapi.testclient import TestClient
-    from apps.api.main import app
+
     from agent.runtime import loop as loop_mod
-    from agent.runtime.state import AgentState
+    from apps.api.main import app
 
     def fake_run(state, planner=None, **kw):
         state.status = "done"
@@ -430,8 +573,8 @@ def test_no_approval_field_when_not_paused(monkeypatch):
 def test_chat_end_to_end_paused_with_aid(monkeypatch):
     """真集成测试: Planner emits call_tool(高风险) -> guarded_executor -> paused -> /chat surfaces aid."""
     from fastapi.testclient import TestClient
+
     from apps.api.main import app
-    from agent.runtime.state import AgentState
 
     # mock planner: emit call_tool for scm.purchase.create (high-risk)
     def fake_planner(state):

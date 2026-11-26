@@ -2,6 +2,7 @@
 import re
 
 _SENT_SPLIT = re.compile(r"[.!?。！？\n]+")
+_TRIM = re.compile(r"^[.,;:!?()\[\]{}<>\"'`·、，。；：！？()【】《》\s]+|[.,;:!?()\[\]{}<>\"'`·、，。；：！？()【】《》\s]+$")
 _STOPWORDS = set("""a an the of to in on for with and or but is are was were be been being it its this that
                 these those at by from as into about over under up down out off so than then too very
                 我 你 他 她 它 我们 你们 他们 这 那 的 了 是 在 有 和 与 或 但 也 都 就 还 而 及 以
@@ -15,7 +16,7 @@ def _keywords(text: str, top: int = 5) -> list[str]:
     seen_lower: set[str] = set()
     seen: list[str] = []
     for tok in text.split():
-        t = tok.strip(".,;:!?()[]{}<>\"'`·、，。；：！？()【】《》 ")
+        t = _TRIM.sub("", tok)
         if len(t) < 3 or t.lower() in _STOPWORDS or not any(ch.isalnum() for ch in t):
             continue
         low = t.lower()

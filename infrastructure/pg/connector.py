@@ -3,25 +3,39 @@ import os
 import threading
 import time
 import warnings
-from typing import Any, Sequence
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from typing import Any
 
 
 class OperationalError(Exception):
     pass
 
 
-class BaseConnector:
-    def execute(self, sql: str, params: Sequence[Any] = ()) -> None: ...
+class BaseConnector(ABC):
+    @abstractmethod
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
+        raise NotImplementedError
 
-    def execute_rowcount(self, sql: str, params: Sequence[Any] = ()) -> int: ...
+    @abstractmethod
+    def execute_rowcount(self, sql: str, params: Sequence[Any] = ()) -> int:
+        raise NotImplementedError
 
-    def fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[dict]: ...
+    @abstractmethod
+    def fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        raise NotImplementedError
 
-    def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> dict | None: ...
+    @abstractmethod
+    def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> dict | None:
+        raise NotImplementedError
 
-    def healthcheck(self) -> bool: ...
+    @abstractmethod
+    def healthcheck(self) -> bool:
+        raise NotImplementedError
 
-    def ensure_schema(self) -> None: ...
+    @abstractmethod
+    def ensure_schema(self) -> None:
+        raise NotImplementedError
 
 
 class InMemoryConnector(BaseConnector):
@@ -87,7 +101,7 @@ class InMemoryConnector(BaseConnector):
                     cols = self._cols.get(tname) or [
                         f"c{i}" for i in range(len(params))
                     ]
-                row = dict(zip(cols, params))
+                row = dict(zip(cols, params, strict=False))
                 self._tables.setdefault(tname, []).append(row)
 
     def fetch_all(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
@@ -144,7 +158,11 @@ class PGConnector(BaseConnector):
         from sqlalchemy import create_engine
         dsn = _normalize_dsn(dsn)
         self._engine = create_engine(
-            dsn, pool_size=pool_size, pool_pre_ping=True, future=True
+            dsn,
+            pool_size=pool_size,
+            pool_pre_ping=True,
+            future=True,
+            connect_args={"connect_timeout": 2},
         )
         self._dsn = dsn
 
@@ -171,6 +189,14 @@ class PGConnector(BaseConnector):
                     time.sleep(2 ** (attempt - 1))
         raise OperationalError(str(last))
 
+    def execute_transaction(self, operations: list[tuple[str, Sequence[Any]]]) -> None:
+        from sqlalchemy import text
+
+        with self._engine.begin() as conn:
+            for sql, params in operations:
+                bound_sql, bound_params = _named_params(sql, params)
+                conn.execute(text(bound_sql), bound_params)
+
     def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
         self._run("execute", sql, params)
 
@@ -185,8 +211,11 @@ class PGConnector(BaseConnector):
         return self._run("fetch_one", sql, params)
 
     def healthcheck(self) -> bool:
+        """Single bounded probe; startup/readiness must not inherit query retry delays."""
         try:
-            return self.fetch_one("SELECT 1") is not None
+            from sqlalchemy import text
+            with self._engine.connect() as conn:
+                return conn.execute(text("SELECT 1")).first() is not None
         except Exception:
             return False
 
@@ -205,21 +234,46 @@ def agent_dsn() -> str | None:
     return os.environ.get("AGENT_PG_DSN") or None
 
 
+def strict_persistence_enabled() -> bool:
+    """Production persistence gate; absent/false keeps the offline-compatible default."""
+    return os.environ.get("AGENT_STRICT_PERSISTENCE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def get_agent_connector(dsn: str | None = None) -> BaseConnector | None:
-    """返回可用的 PG connector；无 DSN/不可达时返回 None 让调用方回落 InMemory。"""
+    """Return an Agent PG connector, or fall back only outside strict persistence mode."""
+    strict = strict_persistence_enabled()
     dsn = dsn or agent_dsn()
     if not dsn:
+        if strict:
+            raise OperationalError(
+                "AGENT_PG_DSN is required when AGENT_STRICT_PERSISTENCE is enabled"
+            )
         return None
     try:
         c = PGConnector(dsn, pool_size=int(os.environ.get("AGENT_POOL_SIZE", "3")))
         if not c.healthcheck():
-            warnings.warn("agent PG healthcheck failed; falling back to in-memory")
+            if strict:
+                raise OperationalError("AGENT_PG_DSN healthcheck failed")
+            warnings.warn("agent PG healthcheck failed; falling back to in-memory", stacklevel=2)
             return None
         from .schema import ensure_schema
-        ensure_schema(c)
+        if strict:
+            with warnings.catch_warnings(record=True) as schema_warnings:
+                warnings.simplefilter("always")
+                ensure_schema(c)
+            if schema_warnings:
+                raise OperationalError("AGENT_PG_DSN schema initialization failed")
+        else:
+            ensure_schema(c)
         return c
-    except Exception as e:  # noqa: BLE001 - 持久化不可用不能阻断启动
-        warnings.warn(f"agent PG unavailable ({e}); falling back to in-memory")
+    except OperationalError:
+        raise
+    except Exception as e:  # noqa: BLE001 - strict mode must surface a sanitized failure
+        if strict:
+            raise OperationalError("AGENT_PG_DSN is unavailable") from e
+        warnings.warn(f"agent PG unavailable ({e}); falling back to in-memory", stacklevel=2)
         return None
 
 
@@ -228,16 +282,16 @@ def get_connector() -> BaseConnector:
     offline = os.environ.get("PG_OFFLINE") == "1"
     if offline or not dsn:
         if not dsn:
-            warnings.warn("no PG_DSN set; using InMemoryConnector (dev only)")
+            warnings.warn("no PG_DSN set; using InMemoryConnector (dev only)", stacklevel=2)
         return InMemoryConnector()
     try:
         c = PGConnector(dsn, pool_size=int(os.environ.get("MEMORY_POOL_SIZE", "5")))
         if not c.healthcheck():
-            warnings.warn("PG healthcheck failed; falling back to InMemoryConnector")
+            warnings.warn("PG healthcheck failed; falling back to InMemoryConnector", stacklevel=2)
             return InMemoryConnector()
         from .schema import ensure_schema
         ensure_schema(c)
         return c
     except Exception as e:  # noqa: BLE001 - never block startup
-        warnings.warn(f"PG init failed ({e}); falling back to InMemoryConnector")
+        warnings.warn(f"PG init failed ({e}); falling back to InMemoryConnector", stacklevel=2)
         return InMemoryConnector()
